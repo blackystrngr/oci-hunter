@@ -57,7 +57,7 @@ jobs:
           # The other free shape is AMD: VM.Standard.E2.1.Micro
           OCI_COMPUTE_SHAPE=VM.Standard.E2.1.Micro
           SECOND_MICRO_INSTANCE=True
-          REQUEST_WAIT_TIME_SECS=90
+          REQUEST_WAIT_TIME_SECS=100
           SSH_AUTHORIZED_KEYS_FILE=id_rsa.pub
 
           # SUBNET_ID to use ONLY in case running locally (e.g. from Windows) or
