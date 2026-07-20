@@ -69,7 +69,7 @@ jobs:
           EOF
 
       - name: Run instance creation script
-        run: python main.py
+        run: python -u main.py
 
       - name: Upload results (if instance was created)
         if: always()
