@@ -52,7 +52,7 @@ jobs:
           DISPLAY_NAME=gh-actions-arm-instance
           OCI_COMPUTE_SHAPE=VM.Standard.A1.Flex
           SECOND_MICRO_INSTANCE=False
-          REQUEST_WAIT_TIME_SECS=60
+          REQUEST_WAIT_TIME_SECS=90
           SSH_AUTHORIZED_KEYS_FILE=id_rsa.pub
           OCI_SUBNET_ID=${{ secrets.OCI_SUBNET_ID }}
           OCI_IMAGE_ID=
