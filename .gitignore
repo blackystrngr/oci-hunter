@@ -1,0 +1,13 @@
+oci_config
+oci.env
+oci_api_private_key.pem
+id_rsa.pub
+id_rsa_private
+oci_instance_key
+oci_instance_key.pub
+*.log
+INSTANCE_CREATED
+ERROR_IN_CONFIG.log
+UNHANDLED_ERROR.log
+images_list.json
+__pycache__/
