@@ -1,18 +1,18 @@
 name: OCI Free Tier Instance Creation
 
 on:
-  workflow_dispatch:        # lets you trigger it manually too
+  workflow_dispatch:        # manual trigger
   schedule:
-    - cron: '0 */6 * * *'   # every 6 hours = 4 attempts/day, all day
+    - cron: '0 */6 * * *'   # every 6 hours
 
 concurrency:
   group: oci-instance-creation
-  cancel-in-progress: false  # let a queued run wait instead of killing an in-flight one
+  cancel-in-progress: false
 
 jobs:
   create-instance:
     runs-on: ubuntu-latest
-    timeout-minutes: 340     # stay under GitHub's 360-min (6h) hard cap
+    timeout-minutes: 340     # stay under GitHub's 360-min hard cap (5h 40m)
 
     steps:
       - uses: actions/checkout@v4
@@ -48,103 +48,53 @@ jobs:
         run: |
           cat > oci.env <<EOF
           # OCI Configuration
-          # Paths below are relative to this project folder so the setup works
-          # regardless of your Windows username / drive letter.
           OCI_CONFIG=oci_config
           OCT_FREE_AD=AD-1
           DISPLAY_NAME=agokola
-
-          # The other free shape is AMD: VM.Standard.E2.1.Micro
           OCI_COMPUTE_SHAPE=VM.Standard.E2.1.Micro
           SECOND_MICRO_INSTANCE=True
-          REQUEST_WAIT_TIME_SECS=100
+          REQUEST_WAIT_TIME_SECS=90
           SSH_AUTHORIZED_KEYS_FILE=id_rsa.pub
-
-          # SUBNET_ID to use ONLY in case running locally (e.g. from Windows) or
-          # from a non E2.1.Micro instance.
           OCI_SUBNET_ID=${{ secrets.OCI_SUBNET_ID }}
           OCI_IMAGE_ID=${{ secrets.OCI_IMAGE_ID }}
-
-          # The following are ignored if OCI_IMAGE_ID is specified
           OPERATING_SYSTEM=Canonical Ubuntu
           OS_VERSION=22.04
-
           ASSIGN_PUBLIC_IP=false
-
-          # Boot volume size in GB (minimum is 50)
           BOOT_VOLUME_SIZE=50
-
-          # Gmail Notification
           NOTIFY_EMAIL=False
           EMAIL=
           EMAIL_PASSWORD=
-
-          # Discord Notification (optional)
           DISCORD_WEBHOOK=
-
-          # Telegram Notification (optional)
           TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_USER_ID=${{ secrets.TELEGRAM_USER_ID }}
           EOF
 
-      - name: Notify Telegram (run started)
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-        run: |
-          if [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_USER_ID" ]; then
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-              -d chat_id="${TELEGRAM_USER_ID}" \
-              -d text="🚀 OCI instance creation run started (run #${{ github.run_number }})"
-          else
-            echo "Telegram not configured, skipping notification."
-          fi
-
-      - name: Run instance creation script (with live log tailing)
+      - name: Run instance creation script (tail only launch_instance.log)
         run: |
           set -o pipefail
 
-          # Launch main.py in the background so we can tail its log files live
+          # Start main.py in the background
           python -u main.py &
           MAIN_PID=$!
 
-          # Wait briefly for the log files to appear before tailing them
+          # Wait for launch_instance.log to appear (up to 30 seconds)
           for i in $(seq 1 30); do
-            [ -f launch_instance.log ] && [ -f setup_and_info.log ] && break
+            [ -f launch_instance.log ] && break
             sleep 1
           done
-          touch launch_instance.log setup_and_info.log
+          touch launch_instance.log  # ensure it exists
 
-          # Stream both log files to the live Actions console
-          tail -n +1 -f launch_instance.log setup_and_info.log &
+          # Tail only launch_instance.log
+          tail -n +1 -f launch_instance.log &
           TAIL_PID=$!
 
-          # Wait for main.py to finish, then stop tailing and propagate its exit code
+          # Wait for main.py to finish
           wait $MAIN_PID
           MAIN_EXIT=$?
-          kill $TAIL_PID 2>/dev/null || true
+          kill -9 $TAIL_PID 2>/dev/null || true
           exit $MAIN_EXIT
 
-      - name: Notify Telegram (run finished)
-        if: always()
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
-        run: |
-          if [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_USER_ID" ]; then
-            if [ "${{ job.status }}" = "success" ]; then
-              MSG="✅ OCI instance creation run finished successfully (run #${{ github.run_number }})"
-            else
-              MSG="❌ OCI instance creation run failed or was cancelled (run #${{ github.run_number }})"
-            fi
-            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-              -d chat_id="${TELEGRAM_USER_ID}" \
-              -d text="$MSG"
-          else
-            echo "Telegram not configured, skipping notification."
-          fi
-
-      - name: Upload results (if instance was created)
+      - name: Upload artifacts (logs, results)
         if: always()
         uses: actions/upload-artifact@v4
         with:
