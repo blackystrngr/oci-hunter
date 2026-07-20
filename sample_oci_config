@@ -1,0 +1,8 @@
+[DEFAULT]
+user=ocid1.user.oc1..aaaaaaaa
+fingerprint=2e:c0:...
+tenancy=ocid1.tenancy.oc1..aaaaaaaapoaaa
+region=ap-hyderabad-1
+# Forward slashes work fine on Windows in this file, e.g.:
+# key_file=C:/Users/yourname/oracle-freetier-instance-creation/oci_api_private_key.pem
+key_file=oci_api_private_key.pem
