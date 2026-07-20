@@ -1,19 +1,8 @@
 """
 main.py - Oracle Free Tier Instance Creation
 
-Pure-Python, cross-platform (Windows / macOS / Linux) version.
-Repeatedly tries to launch an Oracle Cloud "Always Free" compute instance
-(ARM A1.Flex or E2.1.Micro) until it succeeds, then optionally notifies you
-by email and/or Discord.
-
-Run directly with the system Python interpreter - no virtual environment
-required:
-
-    python main.py
-
-Configuration comes from oci.env (see setup_env.py to generate one
-interactively) and from the OCI config file referenced by OCI_CONFIG
-inside oci.env.
+Pure-Python, cross-platform version.
+Retries indefinitely until an instance is created or the job is killed.
 """
 
 import configparser
@@ -35,32 +24,19 @@ import requests
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Paths - resolved relative to THIS FILE, not the current working directory.
-# This means the script behaves the same whether you double-click it,
-# run it from PowerShell in the project folder, or launch it from a
-# scheduled task on Windows.
+# Paths
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / "oci.env"
-
-# Load environment variables from oci.env
 load_dotenv(ENV_FILE)
 
 ARM_SHAPE = "VM.Standard.A1.Flex"
 E2_MICRO_SHAPE = "VM.Standard.E2.1.Micro"
 
-
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
 def resolve_path(value: str, default_name: str) -> str:
-    """Resolve a path from oci.env.
-
-    - If the env var is blank, fall back to a file of `default_name`
-      sitting next to this script.
-    - If the env var holds a relative path, resolve it relative to this
-      script's directory (so it doesn't matter what folder you launched
-      the script from).
-    - If it's already absolute (e.g. "C:/Users/you/oci_config" or
-      "/home/ubuntu/oci_config"), leave it alone.
-    """
     value = (value or "").strip()
     if not value:
         return str(BASE_DIR / default_name)
@@ -69,8 +45,6 @@ def resolve_path(value: str, default_name: str) -> str:
         path = BASE_DIR / path
     return str(path)
 
-
-# Access loaded environment variables and strip white spaces
 OCI_CONFIG = resolve_path(os.getenv("OCI_CONFIG", ""), "oci_config")
 OCT_FREE_AD = os.getenv("OCT_FREE_AD", "").strip()
 DISPLAY_NAME = os.getenv("DISPLAY_NAME", "").strip()
@@ -88,27 +62,23 @@ NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "False").strip().lower() == "true"
 EMAIL = os.getenv("EMAIL", "").strip()
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "").strip()
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID", "").strip()
 
 # ---------------------------------------------------------------------------
-# Validate the oci_config file and the oci.env values before doing anything
-# expensive. Mirrors the original bash-driven workflow: a bad config drops
-# an ERROR_IN_CONFIG.log file that setup_init.py checks for.
+# Validate config
 # ---------------------------------------------------------------------------
 env_config_parser = configparser.ConfigParser()
 try:
     if not Path(OCI_CONFIG).is_file():
         raise configparser.Error(f"oci_config file not found at: {OCI_CONFIG}")
-
     env_config_parser.read(OCI_CONFIG)
     OCI_USER_ID = env_config_parser.get("DEFAULT", "user")
-
     if OCI_COMPUTE_SHAPE not in (ARM_SHAPE, E2_MICRO_SHAPE):
         raise ValueError(f"{OCI_COMPUTE_SHAPE} is not an acceptable shape")
-
-    
 except (configparser.Error, ValueError) as e:
-    with open(BASE_DIR / "ERROR_IN_CONFIG.log", "w", encoding="utf-8") as file:
-        file.write(str(e))
+    with open(BASE_DIR / "ERROR_IN_CONFIG.log", "w", encoding="utf-8") as f:
+        f.write(str(e))
     print(f"Error reading the configuration file: {e}")
     sys.exit(1)
 
@@ -127,7 +97,7 @@ fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logging_step5.addHandler(fh)
 
 # ---------------------------------------------------------------------------
-# OCI SDK clients
+# OCI clients
 # ---------------------------------------------------------------------------
 oci_config = oci.config.from_file(OCI_CONFIG)
 iam_client = oci.identity.IdentityClient(oci_config)
@@ -135,33 +105,38 @@ network_client = oci.core.VirtualNetworkClient(oci_config)
 compute_client = oci.core.ComputeClient(oci_config)
 
 IMAGE_LIST_KEYS = [
-    "lifecycle_state",
-    "display_name",
-    "id",
-    "operating_system",
-    "operating_system_version",
-    "size_in_mbs",
-    "time_created",
+    "lifecycle_state", "display_name", "id", "operating_system",
+    "operating_system_version", "size_in_mbs", "time_created"
 ]
 
+# ---------------------------------------------------------------------------
+# Telegram sender
+# ---------------------------------------------------------------------------
+def send_telegram_message(text: str) -> None:
+    if TELEGRAM_TOKEN and TELEGRAM_USER_ID:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            payload = {"chat_id": TELEGRAM_USER_ID, "text": text}
+            resp = requests.post(url, data=payload, timeout=10)
+            resp.raise_for_status()
+        except Exception as e:
+            logging.error("Failed to send Telegram message: %s", e)
 
+# ---------------------------------------------------------------------------
+# Helpers (unchanged)
+# ---------------------------------------------------------------------------
 def write_into_file(file_path, data):
-    """Append data into a file located next to this script."""
     full_path = BASE_DIR / file_path
-    with open(full_path, mode="a", encoding="utf-8") as file_writer:
-        file_writer.write(data)
-
+    with open(full_path, mode="a", encoding="utf-8") as f:
+        f.write(data)
 
 def send_email(subject, body, email, password):
-    """Send an HTML email using the SMTP protocol (Gmail)."""
     message = MIMEMultipart()
     message["Subject"] = subject
     message["From"] = email
     message["To"] = email
-
     html_body = MIMEText(body, "html")
     message.attach(html_body)
-
     with smtplib.SMTP("smtp.gmail.com", 587) as server:
         try:
             server.starttls()
@@ -171,18 +146,13 @@ def send_email(subject, body, email, password):
             logging.error("Error while sending email: %s", mail_err)
             raise
 
-
 def list_all_instances(compartment_id):
-    """Retrieve a list of all instances in the specified compartment."""
-    list_instances_response = compute_client.list_instances(compartment_id=compartment_id)
-    return list_instances_response.data
-
+    return compute_client.list_instances(compartment_id=compartment_id).data
 
 def generate_html_body(instance):
-    """Generate HTML body for the email with instance details."""
     template_path = BASE_DIR / "email_content.html"
-    with open(template_path, "r", encoding="utf-8") as email_temp:
-        html_template = email_temp.read()
+    with open(template_path, "r", encoding="utf-8") as f:
+        html_template = f.read()
     html_body = html_template.replace("<INSTANCE_ID>", instance.id)
     html_body = html_body.replace("<DISPLAY_NAME>", instance.display_name)
     html_body = html_body.replace("<AD>", instance.availability_domain)
@@ -190,9 +160,7 @@ def generate_html_body(instance):
     html_body = html_body.replace("<STATE>", instance.lifecycle_state)
     return html_body
 
-
 def create_instance_details_file_and_notify(instance, shape=ARM_SHAPE):
-    """Create a file with details of the instance and notify the user."""
     details = [
         f"Instance ID: {instance.id}",
         f"Display Name: {instance.display_name}",
@@ -201,19 +169,13 @@ def create_instance_details_file_and_notify(instance, shape=ARM_SHAPE):
         f"State: {instance.lifecycle_state}",
         "\n",
     ]
-    micro_body = "Two Micro Instances are already existing and running"
-    arm_body = "\n".join(details)
-    body = arm_body if shape == ARM_SHAPE else micro_body
+    body = "\n".join(details) if shape == ARM_SHAPE else "Two Micro Instances are already existing and running"
     write_into_file("INSTANCE_CREATED", body)
-
     html_body = generate_html_body(instance)
-
     if NOTIFY_EMAIL:
         send_email("OCI INSTANCE CREATED", html_body, EMAIL, EMAIL_PASSWORD)
 
-
 def notify_on_failure(failure_msg):
-    """Notify the user when instance creation fails with an unhandled error."""
     mail_body = (
         "The script encountered an unhandled error and exited unexpectedly.\n\n"
         "Please re-run the script by executing 'python setup_init.py rerun'.\n\n"
@@ -223,67 +185,51 @@ def notify_on_failure(failure_msg):
         f"{failure_msg}"
     )
     write_into_file("UNHANDLED_ERROR.log", mail_body)
-
     if NOTIFY_EMAIL:
         send_email("OCI INSTANCE CREATION SCRIPT: FAILED DUE TO AN ERROR", mail_body, EMAIL, EMAIL_PASSWORD)
 
-
 def check_instance_state_and_write(compartment_id, shape, states=("RUNNING", "PROVISIONING"), tries=3):
-    """Check the state of instances in the compartment and act if found."""
     for _ in range(tries):
         instance_list = list_all_instances(compartment_id=compartment_id)
         if shape == ARM_SHAPE:
             running_arm_instance = next(
-                (
-                    instance
-                    for instance in instance_list
-                    if instance.shape == shape and instance.lifecycle_state in states
-                ),
-                None,
+                (inst for inst in instance_list if inst.shape == shape and inst.lifecycle_state in states),
+                None
             )
             if running_arm_instance:
                 create_instance_details_file_and_notify(running_arm_instance, shape)
                 return True
         else:
             micro_instance_list = [
-                instance
-                for instance in instance_list
-                if instance.shape == shape and instance.lifecycle_state in states
+                inst for inst in instance_list
+                if inst.shape == shape and inst.lifecycle_state in states
             ]
-            if len(micro_instance_list) > 1 and SECOND_MICRO_INSTANCE:
+            if SECOND_MICRO_INSTANCE and len(micro_instance_list) > 1:
                 create_instance_details_file_and_notify(micro_instance_list[-1], shape)
                 return True
-            if len(micro_instance_list) == 1 and not SECOND_MICRO_INSTANCE:
+            if not SECOND_MICRO_INSTANCE and len(micro_instance_list) == 1:
                 create_instance_details_file_and_notify(micro_instance_list[-1], shape)
                 return True
-
         if tries - 1 > 0:
             time.sleep(60)
     return False
 
-
 def handle_errors(command, data, log):
-    """Handle errors from OCI API calls; retry on known-transient errors."""
     if "code" in data:
-        if (data["code"] in ("TooManyRequests", "Out of host capacity.", "InternalError")) or (
-            data.get("message") in ("Out of host capacity.", "Bad Gateway")
-        ):
+        if (data["code"] in ("TooManyRequests", "Out of host capacity.", "InternalError")) or \
+           (data.get("message") in ("Out of host capacity.", "Bad Gateway")):
             log.info("Command: %s--\nOutput: %s", command, data)
             time.sleep(WAIT_TIME)
             return True
-
     if data.get("status") == 502:
         log.info("Command: %s~~\nOutput: %s", command, data)
         time.sleep(WAIT_TIME)
         return True
-
     failure_msg = "\n".join([f"{key}: {value}" for key, value in data.items()])
     notify_on_failure(failure_msg)
     raise Exception(f"Error: {data}")
 
-
 def execute_oci_command(client, method, *args, **kwargs):
-    """Execute an OCI SDK call, retrying on transient errors."""
     while True:
         try:
             response = getattr(client, method)(*args, **kwargs)
@@ -292,9 +238,7 @@ def execute_oci_command(client, method, *args, **kwargs):
             data = {"status": srv_err.status, "code": srv_err.code, "message": srv_err.message}
             handle_errors(args, data, logging_step5)
 
-
-def generate_ssh_key_pair(public_key_file: Union[str, Path], private_key_file: Union[str, Path]):
-    """Generate an SSH key pair and save them to the specified files."""
+def generate_ssh_key_pair(public_key_file, private_key_file):
     key = paramiko.RSAKey.generate(2048)
     key.write_private_key_file(str(private_key_file))
     write_into_file(
@@ -302,22 +246,17 @@ def generate_ssh_key_pair(public_key_file: Union[str, Path], private_key_file: U
         f"ssh-rsa {key.get_base64()} {Path(public_key_file).stem}_auto_generated",
     )
 
-
-def read_or_generate_ssh_public_key(public_key_file: Union[str, Path]):
-    """Read the SSH public key from file, generating a key pair if needed."""
+def read_or_generate_ssh_public_key(public_key_file):
     public_key_path = Path(public_key_file)
     if not public_key_path.is_file():
         logging.info("SSH key doesn't exist... Generating SSH Key Pair")
         public_key_path.parent.mkdir(parents=True, exist_ok=True)
         private_key_path = public_key_path.with_name(f"{public_key_path.stem}_private")
         generate_ssh_key_pair(public_key_path, private_key_path)
-
-    with open(public_key_path, "r", encoding="utf-8") as pub_key_file:
-        return pub_key_file.read()
-
+    with open(public_key_path, "r", encoding="utf-8") as f:
+        return f.read()
 
 def send_discord_message(message):
-    """Send a message to Discord using the configured webhook URL."""
     if DISCORD_WEBHOOK:
         try:
             response = requests.post(DISCORD_WEBHOOK, json={"content": message}, timeout=15)
@@ -325,15 +264,15 @@ def send_discord_message(message):
         except requests.RequestException as e:
             logging.error("Failed to send Discord message: %s", e)
 
-
+# ---------------------------------------------------------------------------
+# Launch logic – infinite retry (no retry counter, no runtime guard)
+# ---------------------------------------------------------------------------
 def launch_instance():
-    """Launch an OCI Compute instance, retrying until it succeeds."""
-    # Step 1 - Get TENANCY
+    # Get tenancy, AD, subnet, image (unchanged)
     user_info = execute_oci_command(iam_client, "get_user", OCI_USER_ID)
     oci_tenancy = user_info.compartment_id
     logging.info("OCI_TENANCY: %s", oci_tenancy)
 
-    # Step 2 - Get AD Name(s)
     availability_domains = execute_oci_command(
         iam_client, "list_availability_domains", compartment_id=oci_tenancy
     )
@@ -350,14 +289,12 @@ def launch_instance():
     oci_ad_names = itertools.cycle(oci_ad_name)
     logging.info("OCI_AD_NAME: %s", oci_ad_name)
 
-    # Step 3 - Get Subnet ID
     oci_subnet_id = OCI_SUBNET_ID
     if not oci_subnet_id:
         subnets = execute_oci_command(network_client, "list_subnets", compartment_id=oci_tenancy)
         oci_subnet_id = subnets[0].id
     logging.info("OCI_SUBNET_ID: %s", oci_subnet_id)
 
-    # Step 4 - Get Image ID
     if not OCI_IMAGE_ID:
         images = execute_oci_command(
             compute_client, "list_images", compartment_id=oci_tenancy, shape=OCI_COMPUTE_SHAPE
@@ -367,8 +304,7 @@ def launch_instance():
         ]
         write_into_file("images_list.json", json.dumps(shortened_images, indent=2))
         oci_image_id = next(
-            image.id
-            for image in images
+            image.id for image in images
             if image.operating_system == OPERATING_SYSTEM and image.operating_system_version == OS_VERSION
         )
         logging.info("OCI_IMAGE_ID: %s", oci_image_id)
@@ -379,7 +315,7 @@ def launch_instance():
     boot_volume_size = max(50, int(BOOT_VOLUME_SIZE))
     ssh_public_key = read_or_generate_ssh_public_key(SSH_AUTHORIZED_KEYS_FILE)
 
-    # Step 5 - Launch instance if it doesn't already exist
+    # Check if instance already exists
     instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE, tries=1)
 
     if OCI_COMPUTE_SHAPE == ARM_SHAPE:
@@ -387,6 +323,7 @@ def launch_instance():
     else:
         shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=1, memory_in_gbs=1)
 
+    # Loop forever until success (or until GitHub kills the job)
     while not instance_exist_flag:
         try:
             launch_instance_response = compute_client.launch_instance(
@@ -420,32 +357,45 @@ def launch_instance():
             if launch_instance_response.status == 200:
                 logging_step5.info("Command: launch_instance\nOutput: %s", launch_instance_response.data)
                 instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE)
+                if instance_exist_flag:
+                    break  # success, exit loop and script
 
         except oci.exceptions.ServiceError as srv_err:
             if srv_err.code == "LimitExceeded":
                 logging_step5.info(
                     "Encountered LimitExceeded error, checking if instance was created. "
                     "code: %s, message: %s, status: %s",
-                    srv_err.code,
-                    srv_err.message,
-                    srv_err.status,
+                    srv_err.code, srv_err.message, srv_err.status
                 )
                 instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE)
                 if instance_exist_flag:
                     logging_step5.info("%s , exiting the program", srv_err.code)
-                    sys.exit()
+                    sys.exit(0)   # success
                 logging_step5.info("Didn't find an instance, proceeding with retries")
-
+            # For other errors, handle_errors will sleep and retry
             data = {"status": srv_err.status, "code": srv_err.code, "message": srv_err.message}
             handle_errors("launch_instance", data, logging_step5)
+        # Any other exception will be caught by the outer try/except in __main__
 
+    # If we get here, instance_exist_flag is True, we can exit successfully
+    logging.info("Instance creation successful.")
+    sys.exit(0)
 
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    send_discord_message("\U0001F680 OCI Instance Creation Script: Starting up! Let's create some cloud magic!")
+    start_msg = "🚀 OCI Instance Creation Script: Starting up! Let's create some cloud magic!"
+    send_discord_message(start_msg)
+    send_telegram_message(start_msg)
+
     try:
         launch_instance()
-        send_discord_message("\U0001F389 Success! OCI Instance has been created. Time to celebrate!")
+        success_msg = "✅ OCI instance creation finished successfully! 🎉"
+        send_discord_message(success_msg)
+        send_telegram_message(success_msg)
     except Exception as e:
-        error_message = f"\U0001F631 Oops! Something went wrong with the OCI Instance Creation Script:\n{str(e)}"
-        send_discord_message(error_message)
+        error_msg = f"❌ Oops! Something went wrong with the OCI Instance Creation Script:\n{str(e)}"
+        send_discord_message(error_msg)
+        send_telegram_message(error_msg)
         raise
