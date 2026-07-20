@@ -47,33 +47,58 @@ jobs:
       - name: Write oci.env
         run: |
           cat > oci.env <<EOF
+          # OCI Configuration
+          # Paths below are relative to this project folder so the setup works
+          # regardless of your Windows username / drive letter.
           OCI_CONFIG=oci_config
           OCT_FREE_AD=AD-1
-          DISPLAY_NAME=harythy
+          DISPLAY_NAME=agokola
+
+          # The other free shape is AMD: VM.Standard.E2.1.Micro
           OCI_COMPUTE_SHAPE=VM.Standard.E2.1.Micro
           SECOND_MICRO_INSTANCE=True
           REQUEST_WAIT_TIME_SECS=90
           SSH_AUTHORIZED_KEYS_FILE=id_rsa.pub
+
+          # SUBNET_ID to use ONLY in case running locally (e.g. from Windows) or
+          # from a non E2.1.Micro instance.
           OCI_SUBNET_ID=${{ secrets.OCI_SUBNET_ID }}
           OCI_IMAGE_ID=${{ secrets.OCI_IMAGE_ID }}
+
+          # The following are ignored if OCI_IMAGE_ID is specified
           OPERATING_SYSTEM=Canonical Ubuntu
           OS_VERSION=22.04
+
           ASSIGN_PUBLIC_IP=false
+
+          # Boot volume size in GB (minimum is 50)
           BOOT_VOLUME_SIZE=50
+
+          # Gmail Notification
           NOTIFY_EMAIL=False
           EMAIL=
           EMAIL_PASSWORD=
-          DISCORD_WEBHOOK=${{ secrets.DISCORD_WEBHOOK }}
+
+          # Discord Notification (optional)
+          DISCORD_WEBHOOK=
+
+          # Telegram Notification (optional)
           TELEGRAM_TOKEN=${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_USER_ID=${{ secrets.TELEGRAM_USER_ID }}
           EOF
 
       - name: Notify Telegram (run started)
-        if: ${{ secrets.TELEGRAM_TOKEN != '' && secrets.TELEGRAM_USER_ID != '' }}
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
-            -d chat_id="${{ secrets.TELEGRAM_USER_ID }}" \
-            -d text="🚀 OCI instance creation run started (run #${{ github.run_number }})"
+          if [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_USER_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_USER_ID}" \
+              -d text="🚀 OCI instance creation run started (run #${{ github.run_number }})"
+          else
+            echo "Telegram not configured, skipping notification."
+          fi
 
       - name: Run instance creation script (with live log tailing)
         run: |
@@ -101,16 +126,23 @@ jobs:
           exit $MAIN_EXIT
 
       - name: Notify Telegram (run finished)
-        if: ${{ always() && secrets.TELEGRAM_TOKEN != '' && secrets.TELEGRAM_USER_ID != '' }}
+        if: always()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: |
-          if [ "${{ job.status }}" = "success" ]; then
-            MSG="✅ OCI instance creation run finished successfully (run #${{ github.run_number }})"
+          if [ -n "$TELEGRAM_TOKEN" ] && [ -n "$TELEGRAM_USER_ID" ]; then
+            if [ "${{ job.status }}" = "success" ]; then
+              MSG="✅ OCI instance creation run finished successfully (run #${{ github.run_number }})"
+            else
+              MSG="❌ OCI instance creation run failed or was cancelled (run #${{ github.run_number }})"
+            fi
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              -d chat_id="${TELEGRAM_USER_ID}" \
+              -d text="$MSG"
           else
-            MSG="❌ OCI instance creation run failed or was cancelled (run #${{ github.run_number }})"
+            echo "Telegram not configured, skipping notification."
           fi
-          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
-            -d chat_id="${{ secrets.TELEGRAM_USER_ID }}" \
-            -d text="$MSG"
 
       - name: Upload results (if instance was created)
         if: always()
