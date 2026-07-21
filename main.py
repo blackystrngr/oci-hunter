@@ -1,8 +1,9 @@
 """
-main.py - Oracle Free Tier Instance Creation
+main.py - Oracle Free Tier Instance Creation (with Fault‑Domain scanning)
 
-Pure-Python, cross-platform version.
-Retries indefinitely until an instance is created or the job is killed.
+Keeps trying to create an Always Free instance by cycling through
+Availability Domains and, within each, trying all Fault Domains.
+Notifications via Telegram, Discord, email.
 """
 
 import configparser
@@ -16,7 +17,7 @@ import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Union
+from typing import Union, Optional
 
 import oci
 import paramiko
@@ -24,7 +25,7 @@ import requests
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths – resolved relative to this file
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / "oci.env"
@@ -165,6 +166,7 @@ def create_instance_details_file_and_notify(instance, shape=ARM_SHAPE):
         f"Instance ID: {instance.id}",
         f"Display Name: {instance.display_name}",
         f"Availability Domain: {instance.availability_domain}",
+        f"Fault Domain: {getattr(instance, 'fault_domain', 'N/A')}",
         f"Shape: {instance.shape}",
         f"State: {instance.lifecycle_state}",
         "\n",
@@ -265,36 +267,55 @@ def send_discord_message(message):
             logging.error("Failed to send Discord message: %s", e)
 
 # ---------------------------------------------------------------------------
-# Launch logic – infinite retry (no retry counter, no runtime guard)
+# Fault‑domain helper
+# ---------------------------------------------------------------------------
+def get_fault_domains(identity_client, compartment_id: str, availability_domain: str) -> list[Optional[str]]:
+    """
+    Return a list of fault domain names for the given Availability Domain.
+    If the API call fails, fall back to [None] so OCI auto‑assigns.
+    """
+    try:
+        response = identity_client.list_fault_domains(compartment_id, availability_domain)
+        return [fd.name for fd in response.data]
+    except oci.exceptions.ServiceError as e:
+        logging.warning("Failed to list fault domains for %s: %s. Will use auto‑assign.", availability_domain, e)
+        return [None]
+
+# ---------------------------------------------------------------------------
+# Launch logic – infinite retry with FD scanning
 # ---------------------------------------------------------------------------
 def launch_instance():
-    # Get tenancy, AD, subnet, image (unchanged)
+    # Get tenancy
     user_info = execute_oci_command(iam_client, "get_user", OCI_USER_ID)
     oci_tenancy = user_info.compartment_id
     logging.info("OCI_TENANCY: %s", oci_tenancy)
 
+    # Get Availability Domains
     availability_domains = execute_oci_command(
         iam_client, "list_availability_domains", compartment_id=oci_tenancy
     )
-    oci_ad_name = [
+    # Filter according to OCT_FREE_AD
+    oci_ad_names = [
         item.name
         for item in availability_domains
         if any(item.name.endswith(oct_ad) for oct_ad in OCT_FREE_AD.split(","))
     ]
-    if not oci_ad_name:
+    if not oci_ad_names:
         raise ValueError(
             f"No availability domain matched OCT_FREE_AD='{OCT_FREE_AD}'. "
             "Check the value in oci.env."
         )
-    oci_ad_names = itertools.cycle(oci_ad_name)
-    logging.info("OCI_AD_NAME: %s", oci_ad_name)
+    ad_cycle = itertools.cycle(oci_ad_names)
+    logging.info("Using Availability Domains: %s", oci_ad_names)
 
+    # Get Subnet ID
     oci_subnet_id = OCI_SUBNET_ID
     if not oci_subnet_id:
         subnets = execute_oci_command(network_client, "list_subnets", compartment_id=oci_tenancy)
         oci_subnet_id = subnets[0].id
     logging.info("OCI_SUBNET_ID: %s", oci_subnet_id)
 
+    # Get Image ID
     if not OCI_IMAGE_ID:
         images = execute_oci_command(
             compute_client, "list_images", compartment_id=oci_tenancy, shape=OCI_COMPUTE_SHAPE
@@ -318,17 +339,24 @@ def launch_instance():
     # Check if instance already exists
     instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE, tries=1)
 
+    # Shape config
     if OCI_COMPUTE_SHAPE == ARM_SHAPE:
         shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=4, memory_in_gbs=24)
     else:
         shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=1, memory_in_gbs=1)
 
-    # Loop forever until success (or until GitHub kills the job)
+    # Main loop – infinite until success
     while not instance_exist_flag:
-        try:
-            launch_instance_response = compute_client.launch_instance(
-                launch_instance_details=oci.core.models.LaunchInstanceDetails(
-                    availability_domain=next(oci_ad_names),
+        ad = next(ad_cycle)
+        fault_domains = get_fault_domains(iam_client, oci_tenancy, ad)
+
+        for fd in fault_domains:
+            logging_step5.info("Attempting launch in AD=%s FD=%s", ad, fd if fd else "auto")
+
+            try:
+                launch_details = oci.core.models.LaunchInstanceDetails(
+                    availability_domain=ad,
+                    fault_domain=fd,   # None means OCI picks
                     compartment_id=oci_tenancy,
                     create_vnic_details=oci.core.models.CreateVnicDetails(
                         assign_public_ip=assign_public_ip,
@@ -352,33 +380,45 @@ def launch_instance():
                     ),
                     metadata={"ssh_authorized_keys": ssh_public_key},
                 )
-            )
 
-            if launch_instance_response.status == 200:
-                logging_step5.info("Command: launch_instance\nOutput: %s", launch_instance_response.data)
-                instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE)
-                if instance_exist_flag:
-                    break  # success, exit loop and script
+                response = compute_client.launch_instance(launch_instance_details=launch_details)
 
-        except oci.exceptions.ServiceError as srv_err:
-            if srv_err.code == "LimitExceeded":
-                logging_step5.info(
-                    "Encountered LimitExceeded error, checking if instance was created. "
-                    "code: %s, message: %s, status: %s",
-                    srv_err.code, srv_err.message, srv_err.status
-                )
-                instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE)
-                if instance_exist_flag:
-                    logging_step5.info("%s , exiting the program", srv_err.code)
-                    sys.exit(0)   # success
-                logging_step5.info("Didn't find an instance, proceeding with retries")
-            # For other errors, handle_errors will sleep and retry
-            data = {"status": srv_err.status, "code": srv_err.code, "message": srv_err.message}
-            handle_errors("launch_instance", data, logging_step5)
-        # Any other exception will be caught by the outer try/except in __main__
+                if response.status == 200:
+                    logging_step5.info("Launch successful in AD=%s FD=%s", ad, fd)
+                    # Poll to confirm instance is running
+                    instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE)
+                    if instance_exist_flag:
+                        return  # success
+                    else:
+                        # Instance launched but not yet in RUNNING/PROVISIONING – we can break and let outer loop re‑check
+                        break
 
-    # If we get here, instance_exist_flag is True, we can exit successfully
-    logging.info("Instance creation successful.")
+            except oci.exceptions.ServiceError as srv_err:
+                # Handle specific errors
+                if srv_err.code == "Out of host capacity":
+                    logging_step5.info("FD %s out of capacity, trying next.", fd)
+                    continue  # try next FD
+                elif srv_err.code == "LimitExceeded":
+                    logging_step5.info(
+                        "LimitExceeded error, checking if instance was already created. "
+                        "code: %s, message: %s", srv_err.code, srv_err.message
+                    )
+                    instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE)
+                    if instance_exist_flag:
+                        return  # success
+                    logging_step5.info("No existing instance found, continuing retries.")
+                    continue   # try next FD or AD
+                else:
+                    # For other errors, use handle_errors (retries on transient, raises on fatal)
+                    data = {"status": srv_err.status, "code": srv_err.code, "message": srv_err.message}
+                    handle_errors("launch_instance", data, logging_step5)
+                    # If handle_errors returns (after sleep), continue to next FD
+
+            # If we get here without success, we'll either continue to next FD or sleep a bit
+        # After all FDs in this AD tried, small pause before cycling to next AD
+        time.sleep(WAIT_TIME)
+
+    # Should never reach here, but just in case
     sys.exit(0)
 
 # ---------------------------------------------------------------------------
