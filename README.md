@@ -1,150 +1,73 @@
-# Oracle Free Tier Instance Creation - Windows Edition (Pure Python, No venv)
+# Oracle Cloud Free Tier Instance Creator (GitHub Actions Edition)
 
-This is a Windows-friendly rebuild of
-[mohankumarpaluru/oracle-freetier-instance-creation](https://github.com/mohankumarpaluru/oracle-freetier-instance-creation).
+This repository contains a Python script and a GitHub Actions workflow that **automatically attempts to create an Always Free OCI compute instance** (ARM Ampere A1.Flex or AMD E2.1.Micro) on Oracle Cloud Infrastructure. It keeps retrying until it succeeds, making use of GitHub Actions’ generous 6‑hour runtime limit.
 
-What changed from the original:
+The script handles common transient errors (e.g. `Out of host capacity`, `TooManyRequests`, `LimitExceeded`) and can notify you via **Telegram**, **Discord**, or **email** when an instance is created or an error occurs.
 
-- The two Bash setup scripts (`setup_env.sh`, `setup_init.sh`) are now
-  **`setup_env.py`** and **`setup_init.py`** - plain Python, no Bash/WSL/curl needed.
-- **No virtual environment.** Dependencies install straight into whichever
-  Python you run the scripts with (`pip install -r requirements.txt` under
-  the hood via `sys.executable -m pip`).
-- `oci.env` and `sample_oci_config` use **relative, portable paths**
-  (`oci_config`, `id_rsa.pub`, etc.) instead of hardcoded
-  `/home/ubuntu/...` paths. `main.py` resolves relative paths against its
-  own folder, so it works no matter what your Windows username or drive
-  letter is, and no matter what folder you launch it from.
-- `main.py` fails with a clear message instead of crashing if `oci_config`
-  is missing, and logs go into the project folder regardless of OS.
+---
 
-## Requirements
+## 🚀 Features
 
-- Python 3.9+ for Windows, installed from [python.org](https://www.python.org/downloads/windows/)
-  or the Microsoft Store. **When installing, tick "Add python.exe to PATH."**
-- An Oracle Cloud account with API key access.
+- ✅ **Unlimited retries** – keeps trying until an instance is successfully launched.
+- ✅ **Supports both ARM (A1.Flex) and AMD (E2.1.Micro)** shapes.
+- ✅ **Works with one or two E2.1.Micro instances** (second free micro option).
+- ✅ **Automatic SSH key generation** if you don’t provide one.
+- ✅ **Notifications**: Telegram (recommended), Discord, email (Gmail).
+- ✅ **GitHub Actions ready** – schedule runs every 6 hours or trigger manually.
+- ✅ **Live log tailing** in the Actions console (`launch_instance.log`).
+- ✅ **Artifact upload** – logs and instance details are saved after each run.
 
-Check Python is on PATH by opening PowerShell or Command Prompt and running:
+---
 
-```
-python --version
-```
+## 📋 Prerequisites
 
-## Setup
+- An Oracle Cloud Free Tier account (or any OCI tenancy with sufficient quota).
+- A GitHub repository (public or private) with **Actions enabled**.
+- OCI API credentials (user OCID, tenancy OCID, fingerprint, private key).
+- **Telegram** (optional but recommended) – create a bot and get your user ID for instant notifications.
 
-1. Download/clone this folder anywhere on your PC, e.g. `C:\Users\you\oracle-freetier-instance-creation`.
+---
 
-2. Open a terminal (PowerShell or CMD) **inside that folder**:
+## 🔐 Setting up Secrets in GitHub
 
-   ```
-   cd C:\Users\you\oracle-freetier-instance-creation
-   ```
+Go to your repository → **Settings** → **Secrets and variables** → **Actions** and add these secrets:
 
-3. Install dependencies directly (no venv):
+| Secret Name | Description |
+|-------------|-------------|
+| `OCI_USER_OCID` | Your OCI user OCID (e.g., `ocid1.user.oc1..aaaa...`) |
+| `OCI_TENANCY_OCID` | Your OCI tenancy OCID |
+| `OCI_FINGERPRINT` | Fingerprint of the API key (from OCI console) |
+| `OCI_PRIVATE_KEY` | **PEM‑encoded private key** (including the `-----BEGIN RSA PRIVATE KEY-----` block) |
+| `OCI_REGION` | OCI region (e.g., `us-ashburn-1`, `eu-frankfurt-1`) |
+| `OCI_SUBNET_ID` | (Optional) Subnet OCID; if not provided, the first subnet is used. |
+| `OCI_IMAGE_ID` | (Optional) Custom image OCID; if omitted, the latest Ubuntu 22.04 image is used. |
+| `SSH_PUBLIC_KEY` | (Optional) Your public SSH key (`id_rsa.pub`). If not provided, a new key pair is generated automatically. |
+| `TELEGRAM_TOKEN` | (Optional) Bot token from [@BotFather](https://t.me/botfather). |
+| `TELEGRAM_USER_ID` | (Optional) Your Telegram user ID (you can get it from [@userinfobot](https://t.me/userinfobot)). |
 
-   ```
-   python -m pip install -r requirements.txt
-   ```
+> **Note:** `TELEGRAM_TOKEN` and `TELEGRAM_USER_ID` are **recommended** for real‑time status updates. If you don’t set them, notifications will be skipped.
 
-   (`setup_init.py` also does this automatically on first run - step 3 here
-   is just so you can test imports/troubleshoot separately if needed.)
+---
 
-4. Get your OCI API key following Oracle's key-generation steps, then:
-   - Save the private key file as `oci_api_private_key.pem` in this folder
-     (any name/location works, as long as `key_file` in `oci_config` points
-     to it).
-   - Copy `sample_oci_config` to a new file named `oci_config` (no
-     extension) and fill in `user`, `fingerprint`, `tenancy`, `region`, and
-     `key_file`.
+## ⚙️ Configuration (Environment Variables)
 
-5. Generate your `oci.env` interactively:
+Most settings are controlled via `oci.env` (generated automatically in the workflow). You can adjust these in the `Write oci.env` step of the workflow:
 
-   ```
-   python setup_env.py
-   ```
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OCI_COMPUTE_SHAPE` | `VM.Standard.A1.Flex` | Use `VM.Standard.E2.1.Micro` for AMD. |
+| `SECOND_MICRO_INSTANCE` | `True` | Allow a second E2.1.Micro instance (only relevant for AMD shape). |
+| `REQUEST_WAIT_TIME_SECS` | `90` | Seconds to wait before retrying after a capacity error. |
+| `DISPLAY_NAME` | `agokola` | Name of the instance. |
+| `OCT_FREE_AD` | `AD-1` | Availability Domain (e.g., `AD-1`, `AD-2`). Use comma‑separated values to cycle. |
+| `ASSIGN_PUBLIC_IP` | `false` | Set to `true` to assign a public IP to the instance. |
+| `BOOT_VOLUME_SIZE` | `50` | Boot volume size in GB (minimum 50). |
 
-   This asks a few questions (instance name, shape, notifications, etc.)
-   and writes `oci.env` for you. If one already exists it's backed up to
-   `oci.env.bak` first. You can also just hand-edit `oci.env` directly -
-   see the comments in the file.
+---
 
-   **Running from your own Windows PC (not an OCI micro instance):** you
-   must fill in `OCI_SUBNET_ID` in `oci.env`, since there's no existing OCI
-   VM to inherit a subnet from. Find it in the OCI Console under
-   *Networking > Virtual Cloud Networks > `<your VCN>` > Subnet Details*.
+## 🧪 Running Locally (for testing)
 
-## Run
-
-```
-python setup_init.py
-```
-
-This will:
-
-1. Install/upgrade dependencies (skip with `python setup_init.py rerun`).
-2. Launch `main.py`, which retries instance creation every
-   `REQUEST_WAIT_TIME_SECS` seconds until it succeeds.
-3. Watch the log files and print/notify status.
-4. Keep running and checking every 60 seconds until `main.py` exits.
-
-Press **Ctrl+C** at any time to stop it cleanly - it will terminate the
-background instance-creation process and send a notification if Discord or
-Telegram are configured.
-
-To re-run later without reinstalling dependencies:
-
-```
-python setup_init.py rerun
-```
-
-### What gets created in this folder while running
-
-- `setup_and_info.log` / `launch_instance.log` - general + API call logs
-- `ERROR_IN_CONFIG.log` - written if `oci_config` or `oci.env` is invalid
-- `INSTANCE_CREATED` - written once an instance exists, with its details
-- `UNHANDLED_ERROR.log` - written on an unexpected error
-- `images_list.json` - list of available images for your chosen shape
-  (only if `OCI_IMAGE_ID` isn't set)
-- `id_rsa.pub` / `id_rsa_private` - auto-generated SSH keypair, if you
-  didn't supply your own
-
-## Environment Variables (`oci.env`)
-
-| Variable | Required | Notes |
-|---|---|---|
-| `OCI_CONFIG` | Yes | Path to your OCI config file. Relative paths resolve next to this script. |
-| `OCT_FREE_AD` | Yes | Free-tier-eligible availability domain suffix(es), comma-separated. |
-| `DISPLAY_NAME` | No | Name for the instance. |
-| `REQUEST_WAIT_TIME_SECS` | No | Seconds between retry attempts. Default 60. |
-| `SSH_AUTHORIZED_KEYS_FILE` | No | Public key path; generated automatically if missing. |
-| `OCI_SUBNET_ID` | Conditional | **Required if running locally/on Windows** rather than from an OCI micro instance. |
-| `OCI_IMAGE_ID` | No | Specific image OCID; if blank, resolved from `OPERATING_SYSTEM`/`OS_VERSION`. |
-| `OCI_COMPUTE_SHAPE` | No | `VM.Standard.A1.Flex` (ARM) or `VM.Standard.E2.1.Micro` (AMD). Default ARM. |
-| `SECOND_MICRO_INSTANCE` | No | `True`/`False` - set True if this is your 2nd free Micro instance. |
-| `OPERATING_SYSTEM` / `OS_VERSION` | No | Used to pick an image when `OCI_IMAGE_ID` is blank. |
-| `ASSIGN_PUBLIC_IP` | No | `true`/`false`. |
-| `BOOT_VOLUME_SIZE` | No | GB, minimum 50. |
-| `NOTIFY_EMAIL` / `EMAIL` / `EMAIL_PASSWORD` | No | Gmail notification on success/failure (use a Gmail App Password). |
-| `DISCORD_WEBHOOK` | No | Discord webhook URL for both `main.py` and `setup_init.py` notifications. |
-| `TELEGRAM_TOKEN` / `TELEGRAM_USER_ID` | No | Telegram bot notifications from `setup_init.py` (status of the wrapper script). |
-
-## Troubleshooting
-
-- **`python` not recognized** - Python isn't on PATH. Reinstall from
-  python.org and tick "Add to PATH," or use `py` instead of `python`.
-- **`ERROR_IN_CONFIG.log` appears** - check `oci_config` for typos/extra
-  spaces, and confirm `key_file` points to a file that actually exists.
-- **`InvalidConfig: fingerprint malformed`** or similar from the OCI SDK -
-  double check you copied the fingerprint/keys exactly as shown in the OCI
-  Console when you created the API key.
-- **Running on your own PC and it can't find a subnet** - set
-  `OCI_SUBNET_ID` in `oci.env` (see above).
-
-## Credits
-
-Original project and OCI automation logic by
-[mohankumarpaluru](https://github.com/mohankumarpaluru/oracle-freetier-instance-creation),
-based in turn on work by
-[xitroff](https://github.com/hitrov/oci-arm-host-capacity).
-This edition just swaps the Linux/Bash/venv-based tooling for pure Python
-so it runs directly on Windows.
+1. **Clone** this repository.
+2. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
