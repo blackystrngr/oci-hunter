@@ -71,3 +71,65 @@ Most settings are controlled via `oci.env` (generated automatically in the workf
 2. **Install dependencies**:
    ```bash
    pip install -r requirements.txt
+Create an oci.env file (see example in the workflow) and place your OCI config file (oci_config) and private key in the same folder.
+
+Run:
+
+bash
+python main.py
+The script will keep retrying until an instance is created.
+
+🔄 GitHub Actions Workflow
+The workflow is defined in .github/workflows/oci-instance.yml. It:
+
+Runs every 6 hours (schedule) or manually via workflow_dispatch.
+
+Installs Python dependencies.
+
+Sets up OCI credentials and environment variables from GitHub Secrets.
+
+Executes main.py with no artificial timeout – it will run until the instance is created or until GitHub’s 6‑hour job limit is reached.
+
+Tails launch_instance.log in real time so you can follow the progress.
+
+Uploads all logs and INSTANCE_CREATED as artifacts for later inspection.
+
+📬 Notifications
+Notifications are sent by the script itself (not via separate workflow steps). They are triggered at:
+
+Start – a message when the script begins.
+
+Success – when an instance is successfully created (includes details).
+
+Unhandled error – if the script crashes unexpectedly.
+
+Telegram (recommended)
+Set TELEGRAM_TOKEN and TELEGRAM_USER_ID secrets. You’ll receive messages like:
+
+text
+🚀 OCI Instance Creation Script: Starting up! Let's create some cloud magic!
+✅ OCI instance creation finished successfully! 🎉
+Discord
+Set the DISCORD_WEBHOOK variable in oci.env (or via workflow environment). The script will send messages to that webhook.
+
+Email (Gmail)
+Set NOTIFY_EMAIL=True, EMAIL, and EMAIL_PASSWORD in oci.env. The script will send an HTML email with instance details.
+
+📁 Artifacts
+After each workflow run, the following files are uploaded as artifacts (if they exist):
+
+INSTANCE_CREATED – contains the created instance’s ID, display name, AD, shape, and state.
+
+*.log – all logs (launch_instance.log, setup_and_info.log, etc.).
+
+images_list.json – a list of available images (only when using an auto‑selected image).
+
+ERROR_IN_CONFIG.log – if there was a configuration error.
+
+🛠️ Troubleshooting
+Instance not created – check the launch_instance.log in the artifacts for error details. Common reasons include quota exhaustion (you already have 4 ARM cores or 2 micro instances) or temporary capacity shortages.
+
+Workflow times out – GitHub caps jobs at 6 hours. If the instance isn’t created by then, the run will be marked as failed, and you’ll need to wait for the next scheduled run.
+
+Telegram not working – verify your bot token and user ID; the bot must have started a chat with you first.
+
