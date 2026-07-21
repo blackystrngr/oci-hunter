@@ -416,7 +416,7 @@ def launch_instance():
 
             # If we get here without success, we'll either continue to next FD or sleep a bit
         # After all FDs in this AD tried, small pause before cycling to next AD
-        time.sleep(WAIT_TIME)
+        
 
     # Should never reach here, but just in case
     sys.exit(0)
