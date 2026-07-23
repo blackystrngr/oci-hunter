@@ -126,7 +126,7 @@ def send_telegram_message(text: str) -> None:
 # ---------------------------------------------------------------------------
 # Helpers (with positive jitter)
 # ---------------------------------------------------------------------------
-def jitter_sleep(base_seconds: float, max_extra: float = 30.0) -> None:
+def jitter_sleep(base_seconds: float, max_extra: float = 10.0) -> None:
     """
     Sleep for base_seconds plus a random extra delay between 0 and max_extra.
     This ensures we never sleep less than base_seconds.
@@ -232,11 +232,11 @@ def handle_errors(command, data, log):
         if (data["code"] in ("TooManyRequests", "Out of host capacity.", "InternalError")) or \
            (data.get("message") in ("Out of host capacity.", "Bad Gateway")):
             log.info("Command: %s--\nOutput: %s", command, data)
-            jitter_sleep(WAIT_TIME, 30.0)   # between 90s and 120s
+            jitter_sleep(WAIT_TIME, 10.0)   # between 90s and 120s
             return True
     if data.get("status") == 502:
         log.info("Command: %s~~\nOutput: %s", command, data)
-        jitter_sleep(WAIT_TIME, 30.0)
+        jitter_sleep(WAIT_TIME, 10.0)
         return True
     failure_msg = "\n".join([f"{key}: {value}" for key, value in data.items()])
     notify_on_failure(failure_msg)
