@@ -1,9 +1,8 @@
 """
-main.py - Oracle Free Tier Instance Creation (with Fault‑Domain scanning)
+main.py - Oracle Free Tier Instance Creation (with positive jitter)
 
-Keeps trying to create an Always Free instance by cycling through
-Availability Domains and, within each, trying all Fault Domains.
-Notifications via Telegram, Discord, email.
+Adds random extra delay (0-30s) to retries to avoid stampeding the API.
+Sleep times are never below the base WAIT_TIME.
 """
 
 import configparser
@@ -11,13 +10,14 @@ import itertools
 import json
 import logging
 import os
+import random
 import smtplib
 import sys
 import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Union, Optional
+from typing import Optional
 
 import oci
 import paramiko
@@ -124,8 +124,18 @@ def send_telegram_message(text: str) -> None:
             logging.error("Failed to send Telegram message: %s", e)
 
 # ---------------------------------------------------------------------------
-# Helpers (unchanged)
+# Helpers (with positive jitter)
 # ---------------------------------------------------------------------------
+def jitter_sleep(base_seconds: float, max_extra: float = 30.0) -> None:
+    """
+    Sleep for base_seconds plus a random extra delay between 0 and max_extra.
+    This ensures we never sleep less than base_seconds.
+    """
+    extra = random.uniform(0, max_extra)
+    sleep_time = base_seconds + extra
+    logging_step5.debug("Sleeping for %.2f seconds (base %.2f + extra %.2f)", sleep_time, base_seconds, extra)
+    time.sleep(sleep_time)
+
 def write_into_file(file_path, data):
     full_path = BASE_DIR / file_path
     with open(full_path, mode="a", encoding="utf-8") as f:
@@ -191,7 +201,7 @@ def notify_on_failure(failure_msg):
         send_email("OCI INSTANCE CREATION SCRIPT: FAILED DUE TO AN ERROR", mail_body, EMAIL, EMAIL_PASSWORD)
 
 def check_instance_state_and_write(compartment_id, shape, states=("RUNNING", "PROVISIONING"), tries=3):
-    for _ in range(tries):
+    for attempt in range(tries):
         instance_list = list_all_instances(compartment_id=compartment_id)
         if shape == ARM_SHAPE:
             running_arm_instance = next(
@@ -212,8 +222,9 @@ def check_instance_state_and_write(compartment_id, shape, states=("RUNNING", "PR
             if not SECOND_MICRO_INSTANCE and len(micro_instance_list) == 1:
                 create_instance_details_file_and_notify(micro_instance_list[-1], shape)
                 return True
-        if tries - 1 > 0:
-            time.sleep(60)
+        if attempt < tries - 1:
+            # Add a small positive jitter to the 60‑second polling (0‑10s extra)
+            jitter_sleep(60.0, 10.0)
     return False
 
 def handle_errors(command, data, log):
@@ -221,11 +232,11 @@ def handle_errors(command, data, log):
         if (data["code"] in ("TooManyRequests", "Out of host capacity.", "InternalError")) or \
            (data.get("message") in ("Out of host capacity.", "Bad Gateway")):
             log.info("Command: %s--\nOutput: %s", command, data)
-            time.sleep(WAIT_TIME)
+            jitter_sleep(WAIT_TIME, 30.0)   # between 90s and 120s
             return True
     if data.get("status") == 502:
         log.info("Command: %s~~\nOutput: %s", command, data)
-        time.sleep(WAIT_TIME)
+        jitter_sleep(WAIT_TIME, 30.0)
         return True
     failure_msg = "\n".join([f"{key}: {value}" for key, value in data.items()])
     notify_on_failure(failure_msg)
@@ -270,10 +281,6 @@ def send_discord_message(message):
 # Fault‑domain helper
 # ---------------------------------------------------------------------------
 def get_fault_domains(identity_client, compartment_id: str, availability_domain: str) -> list[Optional[str]]:
-    """
-    Return a list of fault domain names for the given Availability Domain.
-    If the API call fails, fall back to [None] so OCI auto‑assigns.
-    """
     try:
         response = identity_client.list_fault_domains(compartment_id, availability_domain)
         return [fd.name for fd in response.data]
@@ -282,7 +289,7 @@ def get_fault_domains(identity_client, compartment_id: str, availability_domain:
         return [None]
 
 # ---------------------------------------------------------------------------
-# Launch logic – infinite retry with FD scanning
+# Launch logic – infinite retry with FD scanning and positive jitter
 # ---------------------------------------------------------------------------
 def launch_instance():
     # Get tenancy
@@ -294,7 +301,6 @@ def launch_instance():
     availability_domains = execute_oci_command(
         iam_client, "list_availability_domains", compartment_id=oci_tenancy
     )
-    # Filter according to OCT_FREE_AD
     oci_ad_names = [
         item.name
         for item in availability_domains
@@ -356,7 +362,7 @@ def launch_instance():
             try:
                 launch_details = oci.core.models.LaunchInstanceDetails(
                     availability_domain=ad,
-                    fault_domain=fd,   # None means OCI picks
+                    fault_domain=fd,
                     compartment_id=oci_tenancy,
                     create_vnic_details=oci.core.models.CreateVnicDetails(
                         assign_public_ip=assign_public_ip,
@@ -385,40 +391,29 @@ def launch_instance():
 
                 if response.status == 200:
                     logging_step5.info("Launch successful in AD=%s FD=%s", ad, fd)
-                    # Poll to confirm instance is running
                     instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE)
                     if instance_exist_flag:
                         return  # success
-                    else:
-                        # Instance launched but not yet in RUNNING/PROVISIONING – we can break and let outer loop re‑check
-                        break
 
             except oci.exceptions.ServiceError as srv_err:
-                # Handle specific errors
                 if srv_err.code == "Out of host capacity":
                     logging_step5.info("FD %s out of capacity, trying next.", fd)
                     continue  # try next FD
                 elif srv_err.code == "LimitExceeded":
                     logging_step5.info(
-                        "LimitExceeded error, checking if instance was already created. "
-                        "code: %s, message: %s", srv_err.code, srv_err.message
+                        "LimitExceeded error, checking if instance was already created."
                     )
                     instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE)
                     if instance_exist_flag:
-                        return  # success
-                    logging_step5.info("No existing instance found, continuing retries.")
-                    continue   # try next FD or AD
+                        return
+                    continue
                 else:
-                    # For other errors, use handle_errors (retries on transient, raises on fatal)
                     data = {"status": srv_err.status, "code": srv_err.code, "message": srv_err.message}
                     handle_errors("launch_instance", data, logging_step5)
-                    # If handle_errors returns (after sleep), continue to next FD
+                    # handle_errors sleeps with jitter, then we continue to next FD
 
-            # If we get here without success, we'll either continue to next FD or sleep a bit
-        # After all FDs in this AD tried, small pause before cycling to next AD
-        
+        # After all FDs in this AD tried, immediately loop to next AD (no extra sleep)
 
-    # Should never reach here, but just in case
     sys.exit(0)
 
 # ---------------------------------------------------------------------------
