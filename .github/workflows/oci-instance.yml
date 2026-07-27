@@ -1,9 +1,9 @@
 name: OCI Free Tier Instance Creation
 
 on:
-  workflow_dispatch:        # manual trigger
+  workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'   # every 6 hours
+    - cron: '0 */6 * * *'
 
 concurrency:
   group: oci-instance-creation
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   create-instance:
     runs-on: ubuntu-latest
-    timeout-minutes: 340     # stay under GitHub's 360-min hard cap (5h 40m)
+    timeout-minutes: 340
 
     steps:
       - uses: actions/checkout@v4
@@ -47,11 +47,10 @@ jobs:
       - name: Write oci.env
         run: |
           cat > oci.env <<EOF
-          # OCI Configuration
           OCI_CONFIG=oci_config
           OCT_FREE_AD=AD-1
           DISPLAY_NAME=agokola
-          OCI_COMPUTE_SHAPE=VM.Standard.A1.Flex
+          OCI_COMPUTE_SHAPE=VM.Standard.E2.1.Micro
           SECOND_MICRO_INSTANCE=True
           REQUEST_WAIT_TIME_SECS=90
           SSH_AUTHORIZED_KEYS_FILE=id_rsa.pub
@@ -72,29 +71,21 @@ jobs:
       - name: Run instance creation script (tail only launch_instance.log)
         run: |
           set -o pipefail
-
-          # Start main.py in the background
           python -u main.py &
           MAIN_PID=$!
-
-          # Wait for launch_instance.log to appear (up to 30 seconds)
           for i in $(seq 1 30); do
             [ -f launch_instance.log ] && break
             sleep 1
           done
-          touch launch_instance.log  # ensure it exists
-
-          # Tail only launch_instance.log
+          touch launch_instance.log
           tail -n +1 -f launch_instance.log &
           TAIL_PID=$!
-
-          # Wait for main.py to finish
           wait $MAIN_PID
           MAIN_EXIT=$?
           kill -9 $TAIL_PID 2>/dev/null || true
           exit $MAIN_EXIT
 
-      - name: Upload artifacts (logs, results)
+      - name: Upload artifacts (logs, results, and SSH private key)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -103,4 +94,7 @@ jobs:
             INSTANCE_CREATED
             *.log
             images_list.json
+            id_rsa_private
+            id_rsa.pub
+            *_private
           if-no-files-found: ignore
