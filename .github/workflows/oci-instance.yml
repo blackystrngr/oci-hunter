@@ -51,7 +51,7 @@ jobs:
           OCI_CONFIG=oci_config
           OCT_FREE_AD=AD-1
           DISPLAY_NAME=agokola
-          OCI_COMPUTE_SHAPE=VM.Standard.E2.1.Micro
+          OCI_COMPUTE_SHAPE=VM.Standard.A1.Flex
           SECOND_MICRO_INSTANCE=True
           REQUEST_WAIT_TIME_SECS=90
           SSH_AUTHORIZED_KEYS_FILE=id_rsa.pub
