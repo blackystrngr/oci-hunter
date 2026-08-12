@@ -3,7 +3,7 @@ name: OCI Start – Continuous Retry (up to 6 hours)
 on:
   workflow_dispatch:               # manual start
   schedule:
-    - cron: '0 0 * * *'            # run once per day (optional)
+    - cron: '0 0 * * *'            # optional daily run
 
 env:
   OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
@@ -16,14 +16,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --- Install OCI CLI ---
       - name: Install OCI CLI
         run: |
           curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh \
             | bash -s -- --accept-all-defaults
           echo "$HOME/bin" >> $GITHUB_PATH
 
-      # --- Credentials ---
       - name: Write OCI credentials
         run: |
           mkdir -p ~/.oci
@@ -40,80 +38,70 @@ jobs:
           key_file=~/.oci/oci_api_private_key.pem
           EOF
 
-      # --- Validate instance ID ---
       - name: Validate instance ID
-        id: validate
         env:
           INSTANCE_ID: ${{ secrets.OCI_INSTANCE_ID }}
         run: |
           if [ -z "$INSTANCE_ID" ]; then
             echo "❌ OCI_INSTANCE_ID secret is empty" >&2
             exit 1
-          else
-            echo "✅ Instance ID: ${INSTANCE_ID:0:8}..."
           fi
+          echo "✅ Instance ID: ${INSTANCE_ID:0:8}..."
 
-      # --- Continuous retry loop ---
-      - name: Try to start until RUNNING or 6h timeout
+      - name: Continuous retry until RUNNING (or 6h timeout)
         env:
           INSTANCE_ID: ${{ secrets.OCI_INSTANCE_ID }}
         run: |
-          set +e  # don't exit on command errors
-
+          set +e
           START_EPOCH=$(date +%s)
           SIX_HOURS=21600
+          DELAY=10
           ATTEMPT=0
-          DELAY=10  # seconds between attempts
 
           while true; do
             ATTEMPT=$((ATTEMPT + 1))
-            CURRENT_EPOCH=$(date +%s)
-            ELAPSED=$((CURRENT_EPOCH - START_EPOCH))
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - START_EPOCH))
 
             if [ $ELAPSED -gt $SIX_HOURS ]; then
-              echo "⏹️ 6‑hour safety limit reached. Exiting."
+              echo "⏹️ 6‑hour limit reached – exiting."
               exit 0
             fi
 
             echo ""
-            echo "========================================="
-            echo "🔄 Attempt #$ATTEMPT (elapsed: ${ELAPSED}s)"
-            echo "========================================="
+            echo "--- Attempt #$ATTEMPT (${ELAPSED}s elapsed) ---"
 
-            # Get current state
-            STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output)
-            echo "📌 Current state: $STATE"
+            # Get current state (clean, no extra logs)
+            STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
+            echo "📌 Instance state: $STATE"
 
             if [ "$STATE" == "RUNNING" ]; then
               echo "✅ Instance is already RUNNING – success!"
               exit 0
             elif [ "$STATE" == "STOPPED" ]; then
-              echo "🚀 Starting instance ..."
-              # Attempt start with debug output
-              oci compute instance action --action START --instance-id "$INSTANCE_ID" \
-                --wait-for-state RUNNING --max-wait-seconds 300 --debug
-              # If start succeeded, the command above will wait until RUNNING and exit 0.
-              # If it fails (e.g., capacity), we'll catch the exit code and retry.
-              if [ $? -eq 0 ]; then
-                echo "✅ Start successful – instance is RUNNING."
+              echo "🚀 Attempting to start..."
+              # Run the start command without --debug – it prints its own clean error messages.
+              # Capture both stdout and stderr so we can show the error text.
+              OUTPUT=$(oci compute instance action --action START --instance-id "$INSTANCE_ID" \
+                --wait-for-state RUNNING --max-wait-seconds 300 2>&1)
+              EXIT_CODE=$?
+
+              if [ $EXIT_CODE -eq 0 ]; then
+                echo "✅ Instance started successfully and reached RUNNING."
                 exit 0
               else
-                echo "⚠️ Start attempt failed. Will retry in ${DELAY}s."
+                # Extract the error message (the CLI usually prints "ServiceError: {...}")
+                # We'll just print the last few lines of output.
+                ERROR_MSG=$(echo "$OUTPUT" | grep -i "serviceerror" | tail -1 || echo "$OUTPUT" | tail -5)
+                echo "❌ Start failed. Error: $ERROR_MSG"
+                echo "   Will retry in ${DELAY}s..."
               fi
-            elif [ "$STATE" == "STOPPING" ]; then
-              echo "⏳ Instance is STOPPING – waiting for it to become STOPPED."
-            elif [ "$STATE" == "STARTING" ]; then
-              echo "⏳ Instance is STARTING – waiting for it to become RUNNING."
-              # Wait for it to reach RUNNING
-              oci compute instance wait --instance-id "$INSTANCE_ID" --wait-for-state RUNNING --max-wait-seconds 300
-              if [ $? -eq 0 ]; then
-                echo "✅ Instance reached RUNNING."
-                exit 0
-              fi
+            elif [ "$STATE" == "STOPPING" ] || [ "$STATE" == "STARTING" ]; then
+              echo "⏳ Instance is $STATE – waiting for it to become STOPPED or RUNNING."
             else
-              echo "⚠️ Unknown state: $STATE – skipping."
+              echo "⚠️ Unhandled state: $STATE – waiting ${DELAY}s."
             fi
 
-            echo "⏳ Waiting $DELAY seconds before next attempt..."
+            echo "⏳ Sleeping $DELAY seconds..."
             sleep $DELAY
           done
