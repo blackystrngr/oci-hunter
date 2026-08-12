@@ -1,14 +1,9 @@
-name: OCI Start – Continuous Retry (up to 6 hours)
+name: OCI Start – Python SDK (Continuous Retry, up to 6h)
 
 on:
   workflow_dispatch:
   schedule:
     - cron: '0 0 * * *'
-
-env:
-  OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
-  OCI_CLI_MAX_RETRIES: "0"          # disable retries to avoid hanging
-  PYTHONUNBUFFERED: "1"             # force oci (a Python CLI) to flush stdout/stderr immediately instead of buffering
 
 jobs:
   start-instance:
@@ -18,166 +13,128 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install OCI CLI
-        run: |
-          curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh \
-            | bash -s -- --accept-all-defaults
-          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-      - name: Write OCI credentials
-        run: |
-          mkdir -p ~/.oci
-          cat > ~/.oci/oci_api_private_key.pem <<'EOF'
-          ${{ secrets.OCI_PRIVATE_KEY }}
-          EOF
+      - name: Install OCI Python SDK
+        run: pip install oci
 
-          # Fix common paste issues: CRLF line endings and literal \n sequences
-          sed -i 's/\r$//' ~/.oci/oci_api_private_key.pem
-          if ! grep -q "BEGIN" ~/.oci/oci_api_private_key.pem; then
-            echo "❌ Private key doesn't look like a PEM file after write. Check OCI_PRIVATE_KEY secret formatting." >&2
-            exit 1
-          fi
-          # Collapse an accidentally single-line key (literal \n chars) back into real newlines
-          if [ "$(wc -l < ~/.oci/oci_api_private_key.pem)" -le 1 ]; then
-            sed -i 's/\\n/\n/g' ~/.oci/oci_api_private_key.pem
-          fi
-          chmod 600 ~/.oci/oci_api_private_key.pem
-
-          cat > ~/.oci/config <<EOF
-          [DEFAULT]
-          user=${{ secrets.OCI_USER_OCID }}
-          fingerprint=${{ secrets.OCI_FINGERPRINT }}
-          tenancy=${{ secrets.OCI_TENANCY_OCID }}
-          region=${{ secrets.OCI_REGION }}
-          key_file=~/.oci/oci_api_private_key.pem
-          EOF
-          chmod 600 ~/.oci/config
-
-          # Validate the PEM is actually parseable before trusting it for hours of retries
-          if ! openssl rsa -in ~/.oci/oci_api_private_key.pem -check -noout 2>/dev/null \
-             && ! openssl pkey -in ~/.oci/oci_api_private_key.pem -noout 2>/dev/null; then
-            echo "❌ OCI_PRIVATE_KEY is not a valid PEM private key (openssl couldn't parse it)." >&2
-            exit 1
-          fi
-
-      - name: Validate instance ID
+      - name: Run continuous start retry
         env:
-          INSTANCE_ID: ${{ secrets.OCI_INSTANCE_ID }}
-        run: |
-          if [ -z "$INSTANCE_ID" ]; then
-            echo "❌ OCI_INSTANCE_ID secret is empty" >&2
-            exit 1
-          fi
-          echo "✅ Instance ID: ${INSTANCE_ID:0:8}..."
-
-      - name: Verify OCI CLI auth works (fail fast, don't burn 6h on bad creds)
-        run: |
-          if ! command -v oci >/dev/null 2>&1; then
-            echo "❌ oci CLI not found on PATH after install." >&2
-            exit 1
-          fi
-          oci --version
-          if ! oci iam region list >/tmp/region_check.json 2>/tmp/region_check.err; then
-            echo "❌ Auth check failed. This means your OCI credentials/config are wrong — retrying won't help." >&2
-            cat /tmp/region_check.err >&2
-            exit 1
-          fi
-          echo "✅ OCI credentials are valid."
-
-      - name: Network connectivity check to OCI API endpoint
-        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
           OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_INSTANCE_ID: ${{ secrets.OCI_INSTANCE_ID }}
         run: |
-          ENDPOINT="https://iaas.${OCI_REGION}.oraclecloud.com/20160918/instances"
-          echo "Checking reachability of: $ENDPOINT"
-          if curl -v --max-time 15 -o /dev/null -s -w "HTTP %{http_code}, connect %{time_connect}s, total %{time_total}s\n" "$ENDPOINT"; then
-            echo "✅ Endpoint is reachable (some non-200 HTTP code is fine here, we're just checking the connection isn't hanging)."
-          else
-            echo "❌ curl could not connect within 15s. This is a runner-side network/DNS problem to Oracle's API, not your credentials or the retry logic — the oci CLI will hang the same way." >&2
-            exit 1
-          fi
+          python3 - <<'EOF'
+          import os
+          import time
+          import sys
+          import oci
+          from oci.config import from_file
 
-      - name: Continuous retry until RUNNING (or 6h timeout)
-        env:
-          INSTANCE_ID: ${{ secrets.OCI_INSTANCE_ID }}
-        run: |
-          exec < /dev/null
-          set +e
-          START_EPOCH=$(date +%s)
-          SIX_HOURS=21600
-          RETRY_DELAY=10
-          STATE_CHECK_DELAY=5
-          ATTEMPT=0
+          # ---- Configuration from environment ----
+          INSTANCE_ID = os.environ.get("OCI_INSTANCE_ID")
+          if not INSTANCE_ID:
+              print("❌ OCI_INSTANCE_ID not set", file=sys.stderr)
+              sys.exit(1)
 
-          while true; do
-            ATTEMPT=$((ATTEMPT + 1))
-            NOW=$(date +%s)
-            ELAPSED=$((NOW - START_EPOCH))
+          # Build a config dictionary from secrets
+          config = {
+              "user": os.environ["OCI_USER_OCID"],
+              "tenancy": os.environ["OCI_TENANCY_OCID"],
+              "fingerprint": os.environ["OCI_FINGERPRINT"],
+              "region": os.environ["OCI_REGION"],
+              "key_content": os.environ["OCI_PRIVATE_KEY"],  # direct key content
+          }
 
-            if [ $ELAPSED -gt $SIX_HOURS ]; then
-              echo "⏹️ 6‑hour limit reached – exiting."
-              exit 0
-            fi
+          # Validate key format (optional)
+          if not config["key_content"].strip().startswith("-----BEGIN"):
+              print("❌ Private key doesn't start with '-----BEGIN'", file=sys.stderr)
+              sys.exit(1)
 
-            echo ""
-            echo "--- Attempt #$ATTEMPT (${ELAPSED}s elapsed) ---"
+          # Create compute client
+          compute_client = oci.core.ComputeClient(config)
 
-            STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output 2>/tmp/get_state.err)
-            if [ -z "$STATE" ]; then
-              echo "⚠️ Couldn't read instance state. Error:"
-              tail -3 /tmp/get_state.err
-            fi
-            echo "📌 Instance state: $STATE"
+          # ---- Constants ----
+          START_EPOCH = time.time()
+          SIX_HOURS = 21600          # seconds
+          RETRY_DELAY = 10           # seconds between full attempts
+          STATE_CHECK_DELAY = 5      # seconds between state polls after a start
+          WAIT_TIMEOUT = 300         # max seconds to wait for RUNNING after a start
 
-            if [ "$STATE" == "RUNNING" ]; then
-              echo "✅ Instance is already RUNNING – success!"
-              exit 0
-            elif [ "$STATE" == "STOPPED" ]; then
-              echo "🚀 Sending start command (timeout 60s)..."
-              timeout 60 stdbuf -oL -eL oci compute instance action \
-                --action START --instance-id "$INSTANCE_ID" \
-                --connection-timeout 10 --read-timeout 30 --force \
-                2>&1 | tee /tmp/oci_out
-              EXIT_CODE=${PIPESTATUS[0]}
-              OUTPUT=$(cat /tmp/oci_out)
+          def get_state():
+              """Return current lifecycle state of the instance."""
+              try:
+                  response = compute_client.get_instance(instance_id=INSTANCE_ID)
+                  return response.data.lifecycle_state
+              except oci.exceptions.ServiceError as e:
+                  print(f"⚠️ Error getting state: {e.message}", file=sys.stderr)
+                  return None
 
-              if [ $EXIT_CODE -eq 124 ]; then
-                echo "⏰ Timeout: start command took >60 seconds. Partial output (if any):"
-                cat /tmp/oci_out
-              elif [ $EXIT_CODE -eq 0 ]; then
-                echo "✅ Start command accepted (202 Accepted). Waiting for RUNNING..."
-                WAIT_START=$(date +%s)
-                WAIT_TIMEOUT=300
-                while true; do
-                  NOW_WAIT=$(date +%s)
-                  if [ $((NOW_WAIT - WAIT_START)) -gt $WAIT_TIMEOUT ]; then
-                    echo "⏰ Timeout waiting for RUNNING. Will retry."
-                    break
-                  fi
-                  CURRENT_STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
-                  echo "   ➜ Current state: $CURRENT_STATE"
-                  if [ "$CURRENT_STATE" == "RUNNING" ]; then
-                    echo "✅ Instance reached RUNNING – success!"
-                    exit 0
-                  elif [ "$CURRENT_STATE" == "STOPPED" ] || [ "$CURRENT_STATE" == "STOPPING" ]; then
-                    echo "   ⚠️ Instance went back to $CURRENT_STATE – start likely failed."
-                    break
-                  fi
-                  sleep $STATE_CHECK_DELAY
-                done
-              else
-                echo "❌ Start command failed (exit $EXIT_CODE). Full server response:"
-                echo "$OUTPUT"
-                echo "---"
-              fi
-            elif [ "$STATE" == "STOPPING" ] || [ "$STATE" == "STARTING" ]; then
-              echo "⏳ Instance is $STATE – waiting for it to settle."
-              sleep $STATE_CHECK_DELAY
-              continue
-            else
-              echo "⚠️ Unhandled state: $STATE – waiting ${RETRY_DELAY}s."
-            fi
+          def start_instance():
+              """Send start action and return (success, error_message)."""
+              try:
+                  compute_client.instance_action(instance_id=INSTANCE_ID, action="START")
+                  return True, None
+              except oci.exceptions.ServiceError as e:
+                  return False, f"{e.status} {e.code}: {e.message}"
 
-            echo "⏳ Sleeping $RETRY_DELAY seconds before next attempt..."
-            sleep $RETRY_DELAY
-          done
+          # ---- Main loop ----
+          attempt = 0
+          while True:
+              attempt += 1
+              elapsed = int(time.time() - START_EPOCH)
+
+              if elapsed > SIX_HOURS:
+                  print(f"⏹️ 6‑hour limit reached – exiting.")
+                  sys.exit(0)
+
+              print(f"\n--- Attempt #{attempt} ({elapsed}s elapsed) ---")
+
+              state = get_state()
+              print(f"📌 Instance state: {state}")
+
+              if state == "RUNNING":
+                  print("✅ Instance is already RUNNING – success!")
+                  sys.exit(0)
+
+              elif state == "STOPPED":
+                  print("🚀 Sending start command...")
+                  success, err_msg = start_instance()
+
+                  if success:
+                      print("✅ Start command accepted (202 Accepted). Waiting for RUNNING...")
+                      wait_start = time.time()
+                      while True:
+                          if time.time() - wait_start > WAIT_TIMEOUT:
+                              print("⏰ Timeout waiting for RUNNING. Will retry.")
+                              break
+                          current_state = get_state()
+                          print(f"   ➜ Current state: {current_state}")
+                          if current_state == "RUNNING":
+                              print("✅ Instance reached RUNNING – success!")
+                              sys.exit(0)
+                          elif current_state in ("STOPPED", "STOPPING"):
+                              print(f"   ⚠️ Instance went back to {current_state} – start likely failed.")
+                              break
+                          time.sleep(STATE_CHECK_DELAY)
+                  else:
+                      print(f"❌ Start command failed: {err_msg}")
+
+              elif state in ("STOPPING", "STARTING"):
+                  print(f"⏳ Instance is {state} – waiting for it to settle.")
+                  time.sleep(STATE_CHECK_DELAY)
+                  continue
+
+              else:
+                  print(f"⚠️ Unhandled state: {state} – waiting {RETRY_DELAY}s.")
+
+              print(f"⏳ Sleeping {RETRY_DELAY} seconds before next attempt...")
+              time.sleep(RETRY_DELAY)
+
+          EOF
