@@ -8,6 +8,7 @@ on:
 env:
   OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
   OCI_CLI_MAX_RETRIES: "0"          # disable retries to avoid hanging
+  PYTHONUNBUFFERED: "1"             # force oci (a Python CLI) to flush stdout/stderr immediately instead of buffering
 
 jobs:
   start-instance:
@@ -83,6 +84,19 @@ jobs:
           fi
           echo "✅ OCI credentials are valid."
 
+      - name: Network connectivity check to OCI API endpoint
+        env:
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+        run: |
+          ENDPOINT="https://iaas.${OCI_REGION}.oraclecloud.com/20160918/instances"
+          echo "Checking reachability of: $ENDPOINT"
+          if curl -v --max-time 15 -o /dev/null -s -w "HTTP %{http_code}, connect %{time_connect}s, total %{time_total}s\n" "$ENDPOINT"; then
+            echo "✅ Endpoint is reachable (some non-200 HTTP code is fine here, we're just checking the connection isn't hanging)."
+          else
+            echo "❌ curl could not connect within 15s. This is a runner-side network/DNS problem to Oracle's API, not your credentials or the retry logic — the oci CLI will hang the same way." >&2
+            exit 1
+          fi
+
       - name: Continuous retry until RUNNING (or 6h timeout)
         env:
           INSTANCE_ID: ${{ secrets.OCI_INSTANCE_ID }}
@@ -119,7 +133,7 @@ jobs:
               exit 0
             elif [ "$STATE" == "STOPPED" ]; then
               echo "🚀 Sending start command (timeout 60s)..."
-              timeout 60 oci compute instance action \
+              timeout 60 stdbuf -oL -eL oci compute instance action \
                 --action START --instance-id "$INSTANCE_ID" \
                 --connection-timeout 10 --read-timeout 30 \
                 2>&1 | tee /tmp/oci_out
