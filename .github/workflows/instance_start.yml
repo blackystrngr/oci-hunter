@@ -118,13 +118,17 @@ jobs:
               echo "✅ Instance is already RUNNING – success!"
               exit 0
             elif [ "$STATE" == "STOPPED" ]; then
-              echo "🚀 Sending start command (timeout 30s)..."
-              timeout 30 oci compute instance action --action START --instance-id "$INSTANCE_ID" > /tmp/oci_out 2>&1
-              EXIT_CODE=$?
+              echo "🚀 Sending start command (timeout 60s)..."
+              timeout 60 oci compute instance action \
+                --action START --instance-id "$INSTANCE_ID" \
+                --connection-timeout 10 --read-timeout 30 \
+                2>&1 | tee /tmp/oci_out
+              EXIT_CODE=${PIPESTATUS[0]}
               OUTPUT=$(cat /tmp/oci_out)
 
               if [ $EXIT_CODE -eq 124 ]; then
-                echo "⏰ Timeout: start command took >30 seconds. Will retry."
+                echo "⏰ Timeout: start command took >60 seconds. Partial output (if any):"
+                cat /tmp/oci_out
               elif [ $EXIT_CODE -eq 0 ]; then
                 echo "✅ Start command accepted (202 Accepted). Waiting for RUNNING..."
                 WAIT_START=$(date +%s)
