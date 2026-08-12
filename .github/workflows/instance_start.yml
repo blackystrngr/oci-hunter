@@ -151,11 +151,9 @@ jobs:
                   sleep $STATE_CHECK_DELAY
                 done
               else
-                ERROR_MSG=$(echo "$OUTPUT" | grep -i "serviceerror" | tail -1)
-                if [ -z "$ERROR_MSG" ]; then
-                  ERROR_MSG=$(echo "$OUTPUT" | tail -3)
-                fi
-                echo "❌ Start command failed (exit $EXIT_CODE). Error: $ERROR_MSG"
+                echo "❌ Start command failed (exit $EXIT_CODE). Full server response:"
+                echo "$OUTPUT"
+                echo "---"
               fi
             elif [ "$STATE" == "STOPPING" ] || [ "$STATE" == "STARTING" ]; then
               echo "⏳ Instance is $STATE – waiting for it to settle."
