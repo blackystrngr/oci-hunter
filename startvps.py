@@ -32,8 +32,8 @@ from oci.exceptions import ServiceError
 # Tunables (mirror the original bash script's constants)
 # --------------------------------------------------------------------------
 
-SIX_HOURS = 6 * 60 * 60      # overall ceiling, seconds
-RETRY_DELAY = 10             # seconds between outer-loop attempts
+SIX_HOURS = 6 * 60 * 60 - 2 * 60 * 10     # overall ceiling, seconds
+RETRY_DELAY = 15             # seconds between outer-loop attempts
 STATE_CHECK_DELAY = 5        # seconds between state polls
 START_WAIT_TIMEOUT = 300     # seconds to wait for RUNNING after issuing START
 CONNECTION_TIMEOUT = 10      # seconds, per SDK call
