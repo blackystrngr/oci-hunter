@@ -101,6 +101,7 @@ jobs:
         env:
           INSTANCE_ID: ${{ secrets.OCI_INSTANCE_ID }}
         run: |
+          exec < /dev/null
           set +e
           START_EPOCH=$(date +%s)
           SIX_HOURS=21600
@@ -135,7 +136,7 @@ jobs:
               echo "🚀 Sending start command (timeout 60s)..."
               timeout 60 stdbuf -oL -eL oci compute instance action \
                 --action START --instance-id "$INSTANCE_ID" \
-                --connection-timeout 10 --read-timeout 30 \
+                --connection-timeout 10 --read-timeout 30 --force \
                 2>&1 | tee /tmp/oci_out
               EXIT_CODE=${PIPESTATUS[0]}
               OUTPUT=$(cat /tmp/oci_out)
