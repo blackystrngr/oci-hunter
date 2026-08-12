@@ -1,9 +1,12 @@
-name: OCI Start – Python SDK (Continuous Retry, up to 6h)
+name: OCI Start – Continuous Retry (up to 6 hours)
 
 on:
   workflow_dispatch:
   schedule:
     - cron: '0 0 * * *'
+
+env:
+  PYTHONUNBUFFERED: "1"   # flush stdout/stderr immediately instead of buffering
 
 jobs:
   start-instance:
@@ -18,123 +21,15 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install OCI Python SDK
-        run: pip install oci
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-      - name: Run continuous start retry
+      - name: Start instance (continuous retry until RUNNING or 6h timeout)
         env:
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
-          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
-          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
           OCI_INSTANCE_ID: ${{ secrets.OCI_INSTANCE_ID }}
-        run: |
-          python3 - <<'EOF'
-          import os
-          import time
-          import sys
-          import oci
-          from oci.config import from_file
-
-          # ---- Configuration from environment ----
-          INSTANCE_ID = os.environ.get("OCI_INSTANCE_ID")
-          if not INSTANCE_ID:
-              print("❌ OCI_INSTANCE_ID not set", file=sys.stderr)
-              sys.exit(1)
-
-          # Build a config dictionary from secrets
-          config = {
-              "user": os.environ["OCI_USER_OCID"],
-              "tenancy": os.environ["OCI_TENANCY_OCID"],
-              "fingerprint": os.environ["OCI_FINGERPRINT"],
-              "region": os.environ["OCI_REGION"],
-              "key_content": os.environ["OCI_PRIVATE_KEY"],  # direct key content
-          }
-
-          # Validate key format (optional)
-          if not config["key_content"].strip().startswith("-----BEGIN"):
-              print("❌ Private key doesn't start with '-----BEGIN'", file=sys.stderr)
-              sys.exit(1)
-
-          # Create compute client
-          compute_client = oci.core.ComputeClient(config)
-
-          # ---- Constants ----
-          START_EPOCH = time.time()
-          SIX_HOURS = 21600          # seconds
-          RETRY_DELAY = 10           # seconds between full attempts
-          STATE_CHECK_DELAY = 5      # seconds between state polls after a start
-          WAIT_TIMEOUT = 300         # max seconds to wait for RUNNING after a start
-
-          def get_state():
-              """Return current lifecycle state of the instance."""
-              try:
-                  response = compute_client.get_instance(instance_id=INSTANCE_ID)
-                  return response.data.lifecycle_state
-              except oci.exceptions.ServiceError as e:
-                  print(f"⚠️ Error getting state: {e.message}", file=sys.stderr)
-                  return None
-
-          def start_instance():
-              """Send start action and return (success, error_message)."""
-              try:
-                  compute_client.instance_action(instance_id=INSTANCE_ID, action="START")
-                  return True, None
-              except oci.exceptions.ServiceError as e:
-                  return False, f"{e.status} {e.code}: {e.message}"
-
-          # ---- Main loop ----
-          attempt = 0
-          while True:
-              attempt += 1
-              elapsed = int(time.time() - START_EPOCH)
-
-              if elapsed > SIX_HOURS:
-                  print(f"⏹️ 6‑hour limit reached – exiting.")
-                  sys.exit(0)
-
-              print(f"\n--- Attempt #{attempt} ({elapsed}s elapsed) ---")
-
-              state = get_state()
-              print(f"📌 Instance state: {state}")
-
-              if state == "RUNNING":
-                  print("✅ Instance is already RUNNING – success!")
-                  sys.exit(0)
-
-              elif state == "STOPPED":
-                  print("🚀 Sending start command...")
-                  success, err_msg = start_instance()
-
-                  if success:
-                      print("✅ Start command accepted (202 Accepted). Waiting for RUNNING...")
-                      wait_start = time.time()
-                      while True:
-                          if time.time() - wait_start > WAIT_TIMEOUT:
-                              print("⏰ Timeout waiting for RUNNING. Will retry.")
-                              break
-                          current_state = get_state()
-                          print(f"   ➜ Current state: {current_state}")
-                          if current_state == "RUNNING":
-                              print("✅ Instance reached RUNNING – success!")
-                              sys.exit(0)
-                          elif current_state in ("STOPPED", "STOPPING"):
-                              print(f"   ⚠️ Instance went back to {current_state} – start likely failed.")
-                              break
-                          time.sleep(STATE_CHECK_DELAY)
-                  else:
-                      print(f"❌ Start command failed: {err_msg}")
-
-              elif state in ("STOPPING", "STARTING"):
-                  print(f"⏳ Instance is {state} – waiting for it to settle.")
-                  time.sleep(STATE_CHECK_DELAY)
-                  continue
-
-              else:
-                  print(f"⚠️ Unhandled state: {state} – waiting {RETRY_DELAY}s.")
-
-              print(f"⏳ Sleeping {RETRY_DELAY} seconds before next attempt...")
-              time.sleep(RETRY_DELAY)
-
-          EOF
+        run: python startvps.py
