@@ -1,68 +1,29 @@
-name: OCI Start Instance (Every Minute, 6‑hour Limit)
+name: OCI Start – Continuous Retry (up to 6 hours)
 
 on:
-  workflow_dispatch:                 # manual trigger
+  workflow_dispatch:               # manual start
   schedule:
-    - cron: '* * * * *'              # runs every minute
-
-concurrency:
-  group: oci-start-instance
-  cancel-in-progress: false
+    - cron: '0 0 * * *'            # run once per day (optional)
 
 env:
-  OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"   # hide .oci/config warning
+  OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
 
 jobs:
   start-instance:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
-
+    timeout-minutes: 360           # 6 hours
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --- 6‑hour safety limit ---
-      - name: Check time limit
-        id: time_check
-        run: |
-          TIMESTAMP_FILE="start_time.txt"
-          CURRENT_EPOCH=$(date +%s)
-          SIX_HOURS=21600
-
-          if [ ! -f "$TIMESTAMP_FILE" ]; then
-            echo "$CURRENT_EPOCH" > "$TIMESTAMP_FILE"
-            echo "should_continue=true" >> $GITHUB_OUTPUT
-          else
-            START_EPOCH=$(cat "$TIMESTAMP_FILE")
-            ELAPSED=$((CURRENT_EPOCH - START_EPOCH))
-            if [ $ELAPSED -gt $SIX_HOURS ]; then
-              echo "should_continue=false" >> $GITHUB_OUTPUT
-            else
-              echo "should_continue=true" >> $GITHUB_OUTPUT
-            fi
-          fi
-
-      - name: Persist timestamp
-        if: always()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add start_time.txt 2>/dev/null || true
-          git commit -m "Update start_time [skip ci]" 2>/dev/null || true
-          git push 2>/dev/null || true
-
-      - name: Stop after 6 hours
-        if: steps.time_check.outputs.should_continue == 'false'
-        run: echo "⏹️ 6‑hour limit reached – no further start attempts." && exit 0
-
-      # --- Install OCI CLI (non‑interactive) ---
+      # --- Install OCI CLI ---
       - name: Install OCI CLI
         run: |
           curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh \
             | bash -s -- --accept-all-defaults
           echo "$HOME/bin" >> $GITHUB_PATH
 
-      # --- Write credentials ---
+      # --- Credentials ---
       - name: Write OCI credentials
         run: |
           mkdir -p ~/.oci
@@ -86,70 +47,73 @@ jobs:
           INSTANCE_ID: ${{ secrets.OCI_INSTANCE_ID }}
         run: |
           if [ -z "$INSTANCE_ID" ]; then
-            echo "❌ OCI_INSTANCE_ID secret is empty or missing." >&2
-            echo "valid=false" >> $GITHUB_OUTPUT
+            echo "❌ OCI_INSTANCE_ID secret is empty" >&2
             exit 1
           else
-            echo "✅ Instance ID found: ${INSTANCE_ID:0:8}..."
-            echo "valid=true" >> $GITHUB_OUTPUT
+            echo "✅ Instance ID: ${INSTANCE_ID:0:8}..."
           fi
 
-      - name: Abort if invalid
-        if: steps.validate.outputs.valid == 'false'
-        run: exit 1
-
-      # --- Check current state (safe, clean output) ---
-      - name: Check current state
-        id: check_state
+      # --- Continuous retry loop ---
+      - name: Try to start until RUNNING or 6h timeout
         env:
           INSTANCE_ID: ${{ secrets.OCI_INSTANCE_ID }}
         run: |
-          STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output)
-          echo "📌 Current state: $STATE"
-          echo "state=$STATE" >> $GITHUB_OUTPUT
+          set +e  # don't exit on command errors
 
-      - name: Already RUNNING – skip
-        if: steps.check_state.outputs.state == 'RUNNING'
-        run: echo "✅ Instance is already RUNNING – nothing to do."
+          START_EPOCH=$(date +%s)
+          SIX_HOURS=21600
+          ATTEMPT=0
+          DELAY=10  # seconds between attempts
 
-      - name: Instance is STOPPING – skip for now
-        if: steps.check_state.outputs.state == 'STOPPING'
-        run: echo "⏳ Instance is STOPPING – will retry next minute."
+          while true; do
+            ATTEMPT=$((ATTEMPT + 1))
+            CURRENT_EPOCH=$(date +%s)
+            ELAPSED=$((CURRENT_EPOCH - START_EPOCH))
 
-      # --- Only attempt start if STOPPED ---
-      - name: Attempt start (only if STOPPED)
-        if: steps.check_state.outputs.state == 'STOPPED'
-        env:
-          INSTANCE_ID: ${{ secrets.OCI_INSTANCE_ID }}
-        run: |
-          echo "🚀 Starting instance $INSTANCE_ID ..."
-          # Don't let temporary errors fail the job
-          set +e
-          oci compute instance action --action START --instance-id "$INSTANCE_ID" \
-            --wait-for-state RUNNING --max-wait-seconds 300 2>&1
-          EXIT_CODE=$?
-          set -e
+            if [ $ELAPSED -gt $SIX_HOURS ]; then
+              echo "⏹️ 6‑hour safety limit reached. Exiting."
+              exit 0
+            fi
 
-          # Print clean final state
-          NEW_STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output)
-          echo "📊 Final state after attempt: $NEW_STATE"
+            echo ""
+            echo "========================================="
+            echo "🔄 Attempt #$ATTEMPT (elapsed: ${ELAPSED}s)"
+            echo "========================================="
 
-          if [ $EXIT_CODE -eq 0 ]; then
-            echo "✅ Start successful – instance reached RUNNING."
-          else
-            echo "⚠️ Start command exited with code $EXIT_CODE (likely capacity or conflict)."
-            echo "   Will retry on the next scheduled run (in 1 minute)."
-          fi
+            # Get current state
+            STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output)
+            echo "📌 Current state: $STATE"
 
-      - name: State not actionable
-        if: steps.check_state.outputs.state != 'RUNNING' && steps.check_state.outputs.state != 'STOPPED' && steps.check_state.outputs.state != 'STOPPING'
-        run: echo "⚠️ Instance is in '${{ steps.check_state.outputs.state }}' – cannot start."
+            if [ "$STATE" == "RUNNING" ]; then
+              echo "✅ Instance is already RUNNING – success!"
+              exit 0
+            elif [ "$STATE" == "STOPPED" ]; then
+              echo "🚀 Starting instance ..."
+              # Attempt start with debug output
+              oci compute instance action --action START --instance-id "$INSTANCE_ID" \
+                --wait-for-state RUNNING --max-wait-seconds 300 --debug
+              # If start succeeded, the command above will wait until RUNNING and exit 0.
+              # If it fails (e.g., capacity), we'll catch the exit code and retry.
+              if [ $? -eq 0 ]; then
+                echo "✅ Start successful – instance is RUNNING."
+                exit 0
+              else
+                echo "⚠️ Start attempt failed. Will retry in ${DELAY}s."
+              fi
+            elif [ "$STATE" == "STOPPING" ]; then
+              echo "⏳ Instance is STOPPING – waiting for it to become STOPPED."
+            elif [ "$STATE" == "STARTING" ]; then
+              echo "⏳ Instance is STARTING – waiting for it to become RUNNING."
+              # Wait for it to reach RUNNING
+              oci compute instance wait --instance-id "$INSTANCE_ID" --wait-for-state RUNNING --max-wait-seconds 300
+              if [ $? -eq 0 ]; then
+                echo "✅ Instance reached RUNNING."
+                exit 0
+              fi
+            else
+              echo "⚠️ Unknown state: $STATE – skipping."
+            fi
 
-      # --- Final state (always shown) ---
-      - name: Final instance state
-        if: always()
-        env:
-          INSTANCE_ID: ${{ secrets.OCI_INSTANCE_ID }}
-        run: |
-          STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output)
-          echo "📊 Final instance state: $STATE"
+            echo "⏳ Waiting $DELAY seconds before next attempt..."
+            sleep $DELAY
+          done
