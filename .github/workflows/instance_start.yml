@@ -7,7 +7,7 @@ on:
 
 env:
   OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
-  OCI_CLI_MAX_RETRIES: 0          # disable retries to avoid hanging
+  OCI_CLI_MAX_RETRIES: "0"          # disable retries to avoid hanging
 
 jobs:
   start-instance:
@@ -21,7 +21,7 @@ jobs:
         run: |
           curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh \
             | bash -s -- --accept-all-defaults
-          echo "$HOME/bin" >> $GITHUB_PATH
+          echo "$HOME/bin" >> "$GITHUB_PATH"
 
       - name: Write OCI credentials
         run: |
@@ -29,7 +29,19 @@ jobs:
           cat > ~/.oci/oci_api_private_key.pem <<'EOF'
           ${{ secrets.OCI_PRIVATE_KEY }}
           EOF
+
+          # Fix common paste issues: CRLF line endings and literal \n sequences
+          sed -i 's/\r$//' ~/.oci/oci_api_private_key.pem
+          if ! grep -q "BEGIN" ~/.oci/oci_api_private_key.pem; then
+            echo "❌ Private key doesn't look like a PEM file after write. Check OCI_PRIVATE_KEY secret formatting." >&2
+            exit 1
+          fi
+          # Collapse an accidentally single-line key (literal \n chars) back into real newlines
+          if [ "$(wc -l < ~/.oci/oci_api_private_key.pem)" -le 1 ]; then
+            sed -i 's/\\n/\n/g' ~/.oci/oci_api_private_key.pem
+          fi
           chmod 600 ~/.oci/oci_api_private_key.pem
+
           cat > ~/.oci/config <<EOF
           [DEFAULT]
           user=${{ secrets.OCI_USER_OCID }}
@@ -38,6 +50,14 @@ jobs:
           region=${{ secrets.OCI_REGION }}
           key_file=~/.oci/oci_api_private_key.pem
           EOF
+          chmod 600 ~/.oci/config
+
+          # Validate the PEM is actually parseable before trusting it for hours of retries
+          if ! openssl rsa -in ~/.oci/oci_api_private_key.pem -check -noout 2>/dev/null \
+             && ! openssl pkey -in ~/.oci/oci_api_private_key.pem -noout 2>/dev/null; then
+            echo "❌ OCI_PRIVATE_KEY is not a valid PEM private key (openssl couldn't parse it)." >&2
+            exit 1
+          fi
 
       - name: Validate instance ID
         env:
@@ -48,6 +68,20 @@ jobs:
             exit 1
           fi
           echo "✅ Instance ID: ${INSTANCE_ID:0:8}..."
+
+      - name: Verify OCI CLI auth works (fail fast, don't burn 6h on bad creds)
+        run: |
+          if ! command -v oci >/dev/null 2>&1; then
+            echo "❌ oci CLI not found on PATH after install." >&2
+            exit 1
+          fi
+          oci --version
+          if ! oci iam region list >/tmp/region_check.json 2>/tmp/region_check.err; then
+            echo "❌ Auth check failed. This means your OCI credentials/config are wrong — retrying won't help." >&2
+            cat /tmp/region_check.err >&2
+            exit 1
+          fi
+          echo "✅ OCI credentials are valid."
 
       - name: Continuous retry until RUNNING (or 6h timeout)
         env:
@@ -73,7 +107,11 @@ jobs:
             echo ""
             echo "--- Attempt #$ATTEMPT (${ELAPSED}s elapsed) ---"
 
-            STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
+            STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output 2>/tmp/get_state.err)
+            if [ -z "$STATE" ]; then
+              echo "⚠️ Couldn't read instance state. Error:"
+              tail -3 /tmp/get_state.err
+            fi
             echo "📌 Instance state: $STATE"
 
             if [ "$STATE" == "RUNNING" ]; then
@@ -81,7 +119,6 @@ jobs:
               exit 0
             elif [ "$STATE" == "STOPPED" ]; then
               echo "🚀 Sending start command (timeout 30s)..."
-              # Use timeout to prevent hanging, capture output and exit code
               timeout 30 oci compute instance action --action START --instance-id "$INSTANCE_ID" > /tmp/oci_out 2>&1
               EXIT_CODE=$?
               OUTPUT=$(cat /tmp/oci_out)
@@ -110,8 +147,10 @@ jobs:
                   sleep $STATE_CHECK_DELAY
                 done
               else
-                # Non-zero exit, not timeout – show error
-                ERROR_MSG=$(echo "$OUTPUT" | grep -i "serviceerror" | tail -1 || echo "$OUTPUT" | tail -3)
+                ERROR_MSG=$(echo "$OUTPUT" | grep -i "serviceerror" | tail -1)
+                if [ -z "$ERROR_MSG" ]; then
+                  ERROR_MSG=$(echo "$OUTPUT" | tail -3)
+                fi
                 echo "❌ Start command failed (exit $EXIT_CODE). Error: $ERROR_MSG"
               fi
             elif [ "$STATE" == "STOPPING" ] || [ "$STATE" == "STARTING" ]; then
