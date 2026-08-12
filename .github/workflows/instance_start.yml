@@ -1,0 +1,78 @@
+name: OCI Start Instance (Every Minute)
+
+on:
+  workflow_dispatch:                          # manual trigger
+  schedule:
+    - cron: '* * * * *'                       # runs every minute
+
+concurrency:
+  group: oci-start-instance
+  cancel-in-progress: false
+
+jobs:
+  start-instance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2                        # allow time for output
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install OCI CLI
+        run: |
+          curl -L https://raw.githubusercontent.com/oracle/oci-cli/master/scripts/install/install.sh | bash
+          echo "$HOME/bin" >> $GITHUB_PATH
+
+      - name: Write OCI credentials
+        run: |
+          mkdir -p ~/.oci
+          cat > ~/.oci/oci_api_private_key.pem <<'EOF'
+          ${{ secrets.OCI_PRIVATE_KEY }}
+          EOF
+          chmod 600 ~/.oci/oci_api_private_key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=${{ secrets.OCI_USER_OCID }}
+          fingerprint=${{ secrets.OCI_FINGERPRINT }}
+          tenancy=${{ secrets.OCI_TENANCY_OCID }}
+          region=${{ secrets.OCI_REGION }}
+          key_file=~/.oci/oci_api_private_key.pem
+          EOF
+
+      - name: Check current instance state
+        id: check_state
+        env:
+          INSTANCE_ID: ocid1.instance.oc1.ap-singapore-1.anzwsljrd24k2fqcpqzzq6jgigfjgtwtialytxe7laxoem3qz4wrmta4g7gq
+        run: |
+          echo "🔍 Fetching current state of instance $INSTANCE_ID ..."
+          STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output)
+          echo "Current state: $STATE"
+          echo "state=$STATE" >> $GITHUB_OUTPUT
+
+      - name: Attempt to start the instance
+        if: steps.check_state.outputs.state != 'RUNNING'
+        env:
+          INSTANCE_ID: ocid1.instance.oc1.ap-singapore-1.anzwsljrd24k2fqcpqzzq6jgigfjgtwtialytxe7laxoem3qz4wrmta4g7gq
+        run: |
+          echo "🚀 Starting instance $INSTANCE_ID ..."
+          # Run the start action and capture output (no || true so failures are visible)
+          oci compute instance action --action START --instance-id "$INSTANCE_ID" \
+            --wait-for-state RUNNING --max-wait-seconds 300 \
+            --debug   # optional: adds extra debug output
+          
+          # After start, show new state
+          NEW_STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output)
+          echo "✅ New state after start attempt: $NEW_STATE"
+
+      - name: Instance already running (skip)
+        if: steps.check_state.outputs.state == 'RUNNING'
+        run: |
+          echo "✅ Instance is already RUNNING. Nothing to do."
+
+      - name: Show final state (always)
+        if: always()
+        env:
+          INSTANCE_ID: ocid1.instance.oc1.ap-singapore-1.anzwsljrd24k2fqcpqzzq6jgigfjgtwtialytxe7laxoem3qz4wrmta4g7gq
+        run: |
+          echo "📊 Final instance state:"
+          oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output
