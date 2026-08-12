@@ -7,6 +7,7 @@ on:
 
 env:
   OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+  OCI_CLI_MAX_RETRIES: 0          # disable retries to avoid hanging
 
 jobs:
   start-instance:
@@ -55,8 +56,8 @@ jobs:
           set +e
           START_EPOCH=$(date +%s)
           SIX_HOURS=21600
-          RETRY_DELAY=10       # seconds between full start attempts
-          STATE_CHECK_DELAY=5  # seconds between state checks after a start
+          RETRY_DELAY=10
+          STATE_CHECK_DELAY=5
           ATTEMPT=0
 
           while true; do
@@ -72,7 +73,6 @@ jobs:
             echo ""
             echo "--- Attempt #$ATTEMPT (${ELAPSED}s elapsed) ---"
 
-            # Get current state (clean)
             STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
             echo "📌 Instance state: $STATE"
 
@@ -80,20 +80,22 @@ jobs:
               echo "✅ Instance is already RUNNING – success!"
               exit 0
             elif [ "$STATE" == "STOPPED" ]; then
-              echo "🚀 Sending start command..."
-              # Run start without waiting – capture output and exit code
-              OUTPUT=$(oci compute instance action --action START --instance-id "$INSTANCE_ID" 2>&1)
+              echo "🚀 Sending start command (timeout 30s)..."
+              # Use timeout to prevent hanging, capture output and exit code
+              timeout 30 oci compute instance action --action START --instance-id "$INSTANCE_ID" > /tmp/oci_out 2>&1
               EXIT_CODE=$?
+              OUTPUT=$(cat /tmp/oci_out)
 
-              if [ $EXIT_CODE -eq 0 ]; then
-                echo "✅ Start command accepted (202 Accepted). Waiting for instance to become RUNNING..."
-                # Now wait for RUNNING with our own loop
+              if [ $EXIT_CODE -eq 124 ]; then
+                echo "⏰ Timeout: start command took >30 seconds. Will retry."
+              elif [ $EXIT_CODE -eq 0 ]; then
+                echo "✅ Start command accepted (202 Accepted). Waiting for RUNNING..."
                 WAIT_START=$(date +%s)
-                WAIT_TIMEOUT=300  # 5 minutes max wait for state change
+                WAIT_TIMEOUT=300
                 while true; do
                   NOW_WAIT=$(date +%s)
                   if [ $((NOW_WAIT - WAIT_START)) -gt $WAIT_TIMEOUT ]; then
-                    echo "⏰ Timeout waiting for RUNNING state. Will retry later."
+                    echo "⏰ Timeout waiting for RUNNING. Will retry."
                     break
                   fi
                   CURRENT_STATE=$(oci compute instance get --instance-id "$INSTANCE_ID" --query 'data."lifecycle-state"' --raw-output 2>/dev/null)
@@ -102,20 +104,18 @@ jobs:
                     echo "✅ Instance reached RUNNING – success!"
                     exit 0
                   elif [ "$CURRENT_STATE" == "STOPPED" ] || [ "$CURRENT_STATE" == "STOPPING" ]; then
-                    # If it went back to STOPPED, the start failed (e.g., capacity)
-                    echo "   ⚠️ Instance reverted to $CURRENT_STATE – start likely failed."
+                    echo "   ⚠️ Instance went back to $CURRENT_STATE – start likely failed."
                     break
                   fi
                   sleep $STATE_CHECK_DELAY
                 done
               else
-                # Start command failed – extract the error message
+                # Non-zero exit, not timeout – show error
                 ERROR_MSG=$(echo "$OUTPUT" | grep -i "serviceerror" | tail -1 || echo "$OUTPUT" | tail -3)
                 echo "❌ Start command failed (exit $EXIT_CODE). Error: $ERROR_MSG"
               fi
             elif [ "$STATE" == "STOPPING" ] || [ "$STATE" == "STARTING" ]; then
               echo "⏳ Instance is $STATE – waiting for it to settle."
-              # Wait a bit before checking again
               sleep $STATE_CHECK_DELAY
               continue
             else
